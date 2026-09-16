@@ -39,17 +39,39 @@ _compiled_create_block_mask = torch.compile(create_block_mask)
 
 
 def _apply_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    # Ascend does not support float64; avoid an implicit device-side downcast.
+    rotary_dtype = torch.float32 if x.device.type == "npu" else torch.float64
     x_complex = torch.view_as_complex(
-        x.to(torch.float64).reshape(*x.shape[:-1], -1, 2)
+        x.to(rotary_dtype).reshape(*x.shape[:-1], -1, 2)
     )
     return torch.view_as_real(x_complex * freqs).flatten(3).to(x.dtype)
 
 
 class ICLAttentionBackend:
-    """Holds the per-forward masks shared by all Transformer blocks."""
+    """Shared masks: CUDA BlockMask/FlexAttention, otherwise dense bool/SDPA.
+
+    Dense masks use True for allowed token pairs and cost O(query_len * key_len)
+    memory. Evaluate the same token predicates on both backends so that training,
+    streaming inference, and MCP retain identical visibility rules.
+    """
 
     self_mask = None
     cross_mask = None
+
+    @staticmethod
+    @torch.no_grad()
+    def _build_mask(mask_mod, query_length, key_length, device, compile_mask):
+        device = torch.device(device)
+        if device.type != "cuda":
+            q_idx = torch.arange(query_length, device=device)[:, None]
+            kv_idx = torch.arange(key_length, device=device)[None, :]
+            index = torch.zeros((), device=device, dtype=torch.long)
+            return mask_mod(index, index, q_idx, kv_idx)[None, None]
+        mask_builder = _compiled_create_block_mask if compile_mask else create_block_mask
+        return mask_builder(
+            mask_mod, 1, 1, query_length, key_length,
+            device=device, _compile=compile_mask,
+        )
 
     @classmethod
     def build_self_mask(
@@ -90,15 +112,12 @@ class ICLAttentionBackend:
             video_to_icl_mask,
         )
 
-        mask_builder = _compiled_create_block_mask if compile_mask else create_block_mask
-        cls.self_mask = mask_builder(
+        cls.self_mask = cls._build_mask(
             mask_mod,
-            1,
-            1,
             len(query_type_ids),
             len(key_type_ids),
             device=device,
-            _compile=compile_mask,
+            compile_mask=compile_mask,
         )
         return cls.self_mask
 
@@ -173,15 +192,12 @@ class ICLAttentionBackend:
                 | icl_to_icl(b, h, q_idx, kv_idx)
             )
 
-        mask_builder = _compiled_create_block_mask if compile_mask else create_block_mask
-        cls.self_mask = mask_builder(
+        cls.self_mask = cls._build_mask(
             mask_mod,
-            1,
-            1,
             len(seq_ids),
             len(seq_ids),
             device=device,
-            _compile=compile_mask,
+            compile_mask=compile_mask,
         )
         return cls.self_mask
 
@@ -196,15 +212,12 @@ class ICLAttentionBackend:
         def sequence_mask(b, h, q_idx, kv_idx):
             return query_seq_ids[q_idx] == encoder_seq_ids[kv_idx]
 
-        mask_builder = _compiled_create_block_mask if compile_mask else create_block_mask
-        cls.cross_mask = mask_builder(
+        cls.cross_mask = cls._build_mask(
             sequence_mask,
-            1,
-            1,
             len(query_seq_ids),
             len(encoder_seq_ids),
             device=device,
-            _compile=compile_mask,
+            compile_mask=compile_mask,
         )
         return cls.cross_mask
 
@@ -228,6 +241,12 @@ class ICLAttentionBackend:
             value = value.to(torch.bfloat16)
         query = query.to(value.dtype)
         key = key.to(value.dtype)
+
+        if isinstance(block_mask, torch.Tensor):
+            return F.scaled_dot_product_attention(
+                query, key, value, attn_mask=block_mask,
+                dropout_p=0.0, is_causal=False,
+            ).transpose(1, 2)
 
         return _compiled_flex_attention(
             query,

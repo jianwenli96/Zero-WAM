@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 from copy import deepcopy
 from pathlib import Path
+import os
 
 from .va_agibot_train_cfg import va_agibot_train_cfg
 
@@ -8,7 +9,9 @@ from .va_agibot_train_cfg import va_agibot_train_cfg
 va_robomind_train_cfg = deepcopy(va_agibot_train_cfg)
 va_robomind_train_cfg.__name__ = 'Config: VA RoboMIND ICL train'
 _repo_root = Path(__file__).resolve().parents[2]
-_human_gen_root = _repo_root / 'data' / 'HumanGen'
+_human_gen_root = Path(os.environ.get(
+    'HUMAN_GEN_ROOT', str(_repo_root / 'data' / 'HumanGen')
+))
 va_robomind_train_cfg.dataset_path = str(_human_gen_root / 'robomind_data')
 va_robomind_train_cfg.icl_manifest_path = str(
     _human_gen_root / 'icl_configs' / 'ICL_config_robomind.json'
