@@ -11,7 +11,29 @@ from wan_va.modules.icl_model import (
 from wan_va.utils import get_mesh_id
 
 
-def _tiny_model(device):
+@pytest.fixture(params=["cpu", "cuda", "npu"])
+def attention_device(request):
+    device = request.param
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    if device == "npu":
+        pytest.importorskip("torch_npu")
+        if not torch.npu.is_available():
+            pytest.skip("NPU unavailable")
+    return device
+
+
+def _mask_values(mask, query_length, key_length):
+    if isinstance(mask, torch.Tensor):
+        return mask[0, 0].cpu()
+    index = torch.tensor(0)
+    return torch.tensor([
+        [bool(mask.mask_mod(index, index, q, k)) for k in range(key_length)]
+        for q in range(query_length)
+    ])
+
+
+def _tiny_model(device, enable_mcp=False):
     model = WanICLTransformer3DModel(
         patch_size=(1, 1, 1),
         num_attention_heads=2,
@@ -27,7 +49,9 @@ def _tiny_model(device):
         action_inner_dim=36,
         action_ffn_dim=16,
         attn_window=4,
-        enable_mcp=False,
+        enable_mcp=enable_mcp,
+        num_mcp_modules=1,
+        mcp_hidden_collect_layers=(0,),
     )
     return model.to(device=device, dtype=torch.bfloat16).eval()
 
@@ -63,26 +87,23 @@ def _input(model, mode, cache_type, frame_id=0):
     }
 
 
-def _training_mask_values():
+def _training_mask_values(device):
     seq_ids = torch.zeros(9, dtype=torch.int)
     frame_ids = torch.tensor([0, 2, 0, 2, 0, 1, 3, 1, 3])
     noise_ids = torch.tensor([0, 0, 1, 1, 1, 0, 0, 1, 1])
     type_ids = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 1])
     icl_ids = torch.tensor([0, 0, 0, 0, 1, 0, 0, 0, 0])
     mask = ICLAttentionBackend.build_training_self_mask(
-        seq_ids=seq_ids,
-        frame_ids=frame_ids,
-        noise_ids=noise_ids,
-        type_ids=type_ids,
-        icl_ids=icl_ids,
+        seq_ids=seq_ids.to(device),
+        frame_ids=frame_ids.to(device),
+        noise_ids=noise_ids.to(device),
+        type_ids=type_ids.to(device),
+        icl_ids=icl_ids.to(device),
         window_size=4,
-        device=torch.device("cpu"),
+        device=torch.device(device),
         compile_mask=False,
     )
-    actual = torch.tensor([
-        [bool(mask.mask_mod(0, 0, q_idx, kv_idx)) for kv_idx in range(9)]
-        for q_idx in range(9)
-    ])
+    actual = _mask_values(mask, 9, 9)
 
     expected = torch.zeros(9, 9, dtype=torch.bool)
     for q_idx in range(9):
@@ -118,14 +139,13 @@ def _training_mask_values():
     return actual, expected
 
 
-def test_training_mask_extends_next_forcing_with_icl_rules():
-    actual, expected = _training_mask_values()
+def test_training_mask_extends_next_forcing_with_icl_rules(attention_device):
+    actual, expected = _training_mask_values(attention_device)
     assert torch.equal(actual, expected)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="flex attention requires CUDA")
-def test_icl_cache_survives_prediction_cleanup():
-    model = _tiny_model("cuda")
+def test_icl_cache_survives_prediction_cleanup(attention_device):
+    model = _tiny_model(attention_device)
     with torch.inference_mode():
         model(
             _input(model, "video", ICL_CACHE_TYPE),
@@ -208,9 +228,9 @@ def test_observation_window_uses_next_frame_boundary():
     assert model.frame_ids_cache.tolist() == [0, 5]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="flex attention requires CUDA")
-def test_icl_training_forward_and_backward():
-    model = _tiny_model("cuda").train()
+@pytest.mark.parametrize("enable_mcp", [False, True])
+def test_icl_training_forward_and_backward(attention_device, enable_mcp):
+    model = _tiny_model(attention_device, enable_mcp=enable_mcp).train()
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
 
@@ -232,6 +252,7 @@ def test_icl_training_forward_and_backward():
 
     output = model(
         {
+            "mcp_latent_dicts": [stream(latent_data, latent_grid)] if enable_mcp else [],
             "latent_dict": stream(latent_data, latent_grid),
             "action_dict": stream(action_data, action_grid),
             "icl_latent_dict": {
@@ -247,9 +268,95 @@ def test_icl_training_forward_and_backward():
         },
         train_mode=True,
     )
-    latent_output, action_output = output
+    latent_output, action_output = output[:2]
     assert latent_output.shape == (1, 4, 4)
     assert action_output.shape == (1, 4, 3)
     loss = latent_output.float().square().mean() + action_output.float().square().mean()
+    if enable_mcp:
+        assert len(output[2]) == 1
+        assert output[2][0].shape == latent_output.shape
+        loss = loss + output[2][0].float().square().mean()
     loss.backward()
     assert torch.isfinite(model.patch_embedding_mlp.weight.grad).all()
+    assert torch.isfinite(model.action_embedder.weight.grad).all()
+    if enable_mcp:
+        assert torch.isfinite(model.mcp_projections[0].weight.grad).all()
+
+
+@pytest.mark.parametrize("window_size", [-1, 0, 4])
+def test_streaming_masks_preserve_icl_window_and_sequence_rules(
+    attention_device, window_size
+):
+    device = attention_device
+    # Video/action queries, two sequences, padding, persistent ICL keys,
+    # and a rectangular cache (more keys than queries).
+    query_types = [0, 1, 0, -1]
+    key_types = [2, 0, 1, 2, 0, -1]
+    query_seqs = [0, 0, 1, -1]
+    key_seqs = [0, 0, 0, 1, 1, -1]
+    query_frames = [8, 8, 0, -1]
+    key_frames = [0, 8, 7, 20, 0, -1]
+    metadata = [query_types, key_types, query_seqs, key_seqs,
+                query_frames, key_frames]
+    mask = ICLAttentionBackend.build_self_mask(
+        *(torch.tensor(values, device=device) for values in metadata),
+        window_size, device, compile_mask=False,
+    )
+    expected = torch.zeros(4, 6, dtype=torch.bool)
+    for q in range(4):
+        for k in range(6):
+            if query_seqs[q] != key_seqs[k] or key_types[k] == -1:
+                continue
+            if key_types[k] == ICL_CACHE_TYPE:
+                expected[q, k] = query_types[q] == 0
+            else:
+                expected[q, k] = (
+                    window_size == -1
+                    or abs(query_frames[q] - key_frames[k]) <= window_size
+                )
+    assert torch.equal(_mask_values(mask, 4, 6), expected)
+
+    cross = ICLAttentionBackend.build_cross_mask(
+        torch.tensor(query_seqs, device=device),
+        torch.tensor([0, 0, 1], device=device), device,
+        compile_mask=False,
+    )
+    assert torch.equal(_mask_values(cross, 4, 3), torch.tensor([
+        [True, True, False], [True, True, False],
+        [False, False, True], [False, False, False],
+    ]))
+
+
+def test_attention_matches_reference_with_fully_masked_rows(attention_device):
+    torch.manual_seed(42)
+    # Use a non-square cross mask and B > 1 to catch layout/broadcast errors.
+    q_cpu = torch.randn(2, 4, 2, 32, dtype=torch.bfloat16)
+    k_cpu = torch.randn(2, 6, 2, 32, dtype=torch.bfloat16)
+    v_cpu = torch.randn_like(k_cpu)
+    q, k, v = [x.to(attention_device).detach().requires_grad_() for x in (q_cpu, k_cpu, v_cpu)]
+    mask = ICLAttentionBackend.build_cross_mask(
+        torch.tensor([0, 0, 1, -1], device=attention_device),
+        torch.tensor([0, 0, 0, 1, 1, 1], device=attention_device),
+        attention_device, compile_mask=False,
+    )
+    actual = ICLAttentionBackend.apply(q, k, v, cross_attention=True, block_mask=mask)
+    q_ref, k_ref, v_ref = [x.float().detach().requires_grad_() for x in (q_cpu, k_cpu, v_cpu)]
+    allowed = torch.tensor([
+        [True, True, True, False, False, False],
+        [True, True, True, False, False, False],
+        [False, False, False, True, True, True],
+        [False, False, False, False, False, False],
+    ])
+    scores = (q_ref.transpose(1, 2) @ k_ref.transpose(1, 2).transpose(-1, -2)) / 32**0.5
+    # Avoid undefined softmax on the all-masked padding row.
+    scores = scores.masked_fill(~allowed, float('-inf'))
+    scores = torch.where(allowed.any(-1, keepdim=True), scores, 0.0)
+    probabilities = scores.softmax(-1).masked_fill(~allowed, 0.0)
+    expected = (probabilities @ v_ref.transpose(1, 2)).transpose(1, 2)
+    torch.testing.assert_close(actual.float().cpu(), expected, atol=0.02, rtol=0.02)
+    assert torch.count_nonzero(actual[:, -1]).item() == 0
+    actual.float().square().sum().backward()
+    expected.square().sum().backward()
+    for tensor, reference in zip((q, k, v), (q_ref, k_ref, v_ref)):
+        assert torch.isfinite(tensor.grad).all()
+        torch.testing.assert_close(tensor.grad.float().cpu(), reference.grad, atol=0.05, rtol=0.05)

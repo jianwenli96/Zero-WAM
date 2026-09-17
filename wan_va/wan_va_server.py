@@ -9,6 +9,12 @@ from diffusers.utils import export_to_video
 
 import numpy as np
 import torch
+try:
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu
+except Exception as e:
+    pass
+
 import torch.nn.functional as F
 from diffusers.pipelines.wan.pipeline_wan import prompt_clean
 from einops import rearrange

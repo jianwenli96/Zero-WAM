@@ -13,8 +13,10 @@ TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 CONFIG_NAME=${CONFIG_NAME:-"robotwin_train"} # MCP is enabled for all training configs
 DATASETS=${DATASETS:-"robotwin:1.0"}
 
-: "${MODEL_PATH:?Set MODEL_PATH to the released zero-wam-pretrain model root}"
-export MODEL_PATH
+# 将模型路径替换为实际位置
+export MODEL_PATH="${MODEL_PATH:-/mnt/sfs_turbo/public/ckpts/Zero-WAM/zero-wam-pretrain}"
+export ZERO_WAM_SAVE_ROOT="${ZERO_WAM_SAVE_ROOT:-/mnt/sfs_turbo/lijianwen/Codes/Zero-WAM/outputs/robotwin_train}"
+export HUMAN_GEN_ROOT="${HUMAN_GEN_ROOT:-/mnt/sfs_turbo/public/datasets/HumanGen}"
 
 overrides=""
 if [ $# -ne 0 ]; then

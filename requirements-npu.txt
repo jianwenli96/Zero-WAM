@@ -1,0 +1,30 @@
+# Ascend stack; see docs/ascend.md for LeRobot installation.
+torch==2.9.0
+torch-npu==2.9.0
+decorator==5.3.1
+attrs>=23.0
+absl-py
+torchvision==0.24.0
+torchaudio==2.9.0
+diffusers==0.36.0
+transformers==4.55.2
+accelerate
+einops
+easydict
+numpy==1.26.4
+tqdm
+imageio[ffmpeg]
+websockets
+msgpack
+opencv-python
+matplotlib
+ftfy
+safetensors
+huggingface_hub
+Pillow
+PyYAML
+
+# Post-training
+# Install lerobot==0.3.3 separately with --no-deps; its torch pin conflicts with 2.9.
+scipy
+wandb

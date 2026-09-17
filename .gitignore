@@ -22,6 +22,9 @@ outputs/
 train_out/
 checkpoints/
 data/
+fusion_result.json
+kernel_meta/
+kernel_meta_*/
 
 *.pt
 !wan_va/assets/empty_text_emb.pt
@@ -30,3 +33,4 @@ data/
 *.safetensors
 
 .DS_Store
+.vscode/

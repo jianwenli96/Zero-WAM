@@ -10,7 +10,9 @@ va_robotwin_train_cfg.update(va_robotwin_cfg)
 va_robotwin_train_cfg.update(zerowam_train_cfg)
 
 _repo_root = Path(__file__).resolve().parents[2]
-_human_gen_root = _repo_root / 'data' / 'HumanGen'
+_human_gen_root = Path(os.environ.get(
+    'HUMAN_GEN_ROOT', str(_repo_root / 'data' / 'HumanGen')
+))
 va_robotwin_train_cfg.model_path = os.environ.get(
     'MODEL_PATH', '/path/to/zero-wam-pretrain'
 )
