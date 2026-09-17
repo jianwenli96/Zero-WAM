@@ -144,3 +144,19 @@ def test_direct_held_out_dataset_construction_is_rejected(tmp_path):
             tmp_path / "stack_blocks_three-demo_clean_collect_200-1000",
             config,
         )
+
+
+def test_manifest_cache_reuses_indexes_and_invalidates_on_change(tmp_path):
+    import json
+    from wan_va.dataset.icl_lerobot_latent_dataset import load_icl_manifest
+    path = tmp_path / 'manifest.json'
+    sample = {'robot_video_path': 'task/videos/chunk-000/camera/episode_000000.mp4',
+              'human_video_path': 'run_a/first.mp4'}
+    path.write_text(json.dumps({'samples': [sample]}))
+    first = load_icl_manifest(path)
+    assert load_icl_manifest(path) is first
+    sample['human_video_path'] = 'run_a/a_changed_video.mp4'
+    path.write_text(json.dumps({'samples': [sample]}))
+    second = load_icl_manifest(path)
+    assert second is not first
+    assert next(iter(second[1].values()))['human_video_path'] == sample['human_video_path']

@@ -1,5 +1,8 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import time
+import random
+import numpy as np
 from copy import deepcopy
 import os
 from pathlib import Path
@@ -50,6 +53,8 @@ from .utils import (
     FlowMatchScheduler
 )
 
+from .dataset.humangen_paths import configure_humangen_source
+
 from .dataset import (
     DistributedDatasetMixtureSampler,
     MixedICLLeRobotLatentDataset,
@@ -64,6 +69,25 @@ import gc
 
 def _safe_mean(tensor):
     return tensor.sum() / max(tensor.numel(), 1)
+
+
+def crop_training_batch(batch, max_frames):
+    """Crop aligned robot latent/action frames; preserve the full ICL prompt."""
+    if max_frames is None:
+        return batch
+    if max_frames <= 0:
+        raise ValueError('max_train_frames must be positive')
+    frames = batch['latents'].shape[2]
+    for key in ('actions', 'actions_mask'):
+        if batch[key].shape[2] != frames:
+            raise ValueError(f'{key} does not align with robot latent frames')
+    if frames <= max_frames:
+        return batch
+    start = torch.randint(frames - max_frames + 1, (1,)).item()
+    cropped = dict(batch)
+    for key in ('latents', 'actions', 'actions_mask'):
+        cropped[key] = batch[key][:, :, start:start + max_frames].contiguous()
+    return cropped
 
 
 _DATASET_PATH_OVERRIDES = (
@@ -96,6 +120,8 @@ def _build_dataset_sources(config, args, rank, local_rank, world_size):
     sources = []
     for name, weight in entries:
         dataset_config = deepcopy(TRAIN_DATASET_CONFIGS[name])
+        if getattr(args, 'human_gen_root', None):
+            configure_humangen_source(dataset_config, name, args.human_gen_root)
         if len(entries) == 1:
             dataset_config.update(path_overrides)
 
@@ -350,7 +376,7 @@ class Trainer:
                 dataset_weights=train_dataset.dataset_weights,
                 num_replicas=config.world_size,
                 rank=config.rank,
-                seed=42,
+                seed=getattr(config, 'seed', 42),
             )
         elif config.world_size > 1:
             train_sampler = DistributedSampler(
@@ -358,7 +384,7 @@ class Trainer:
                 num_replicas=config.world_size,
                 rank=config.rank,
                 shuffle=True,
-                seed=42,
+                seed=getattr(config, 'seed', 42),
             )
         else:
             train_sampler = None
@@ -670,6 +696,7 @@ class Trainer:
 
     def _train_step(self, batch, batch_idx):
         """Train a single batch, returns losses for logging."""
+        batch = crop_training_batch(batch, getattr(self.config, 'max_train_frames', None))
         batch = self.convert_input_format(batch)
         input_dict = self._prepare_input_dict(batch)
         
@@ -843,10 +870,15 @@ class Trainer:
         ] if self.enable_mcp else []
         accumulated_mcp_total_losses = []
         step_in_accumulation = 0
+        torch.cuda.synchronize()
+        step_started = time.perf_counter()
+        data_seconds = 0.0
 
         while self.step < self.config.num_steps:
             # Get next batch (handles epoch reset automatically)
+            data_started = time.perf_counter()
             batch = self._get_next_batch()
+            data_seconds += time.perf_counter() - data_started
             
             losses = self._train_step(batch, step_in_accumulation)
             
@@ -889,6 +921,10 @@ class Trainer:
                     torch.cuda.empty_cache()
                     gc.collect()
 
+                step_seconds = dist_max(torch.tensor(
+                    time.perf_counter() - step_started, device=self.device,
+                    dtype=torch.float32)).item()
+
                 if self.config.rank == 0:
                     total_norm = losses['total_norm']
                     progress_bar.n += 1
@@ -904,6 +940,21 @@ class Trainer:
                     if self.enable_mcp:
                         postfix['mcp_loss'] = f'{mcp_total_loss_show:.4f}'
                     progress_bar.set_postfix(postfix)
+                    metrics = {
+                        'step': self.step + 1,
+                        'video_loss': latent_loss_show,
+                        'action_loss': action_loss_show,
+                        'ifp_loss': mcp_total_loss_show,
+                        'ifp_losses': mcp_loss_shows,
+                        'grad_norm': total_norm.item(),
+                        'learning_rate': lr,
+                        'optimizer_step_skipped': bool(losses['optimizer_step_skipped']),
+                        'total_loss': latent_loss_show + action_loss_show + mcp_total_loss_show,
+                        'step_seconds': step_seconds,
+                        'rank0_data_seconds': data_seconds,
+                    }
+                    with (Path(self.config.save_root) / 'metrics.jsonl').open('a') as handle:
+                        handle.write(json.dumps(metrics) + '\n')
                     if self.config.enable_wandb:
                         log_values = {
                             'loss_metrics/global_avg_video_loss': latent_loss_show,
@@ -932,6 +983,10 @@ class Trainer:
 
             if dist.is_initialized():
                 dist.barrier()
+            if losses['should_log']:
+                torch.cuda.synchronize()
+                step_started = time.perf_counter()
+                data_seconds = 0.0
 
         progress_bar.close()
         logger.info("Training completed!")
@@ -942,6 +997,7 @@ def run(args):
     config = deepcopy(VA_CONFIGS[args.config_name])
 
     overrides = {
+        'seed': args.seed,
         'model_path': args.model_path,
         'empty_emb_path': args.empty_emb_path,
         'learning_rate': args.learning_rate,
@@ -954,6 +1010,7 @@ def run(args):
         'num_steps': args.num_steps,
         'save_interval': args.save_interval,
         'save_root': args.save_root,
+        'max_train_frames': getattr(args, 'max_train_frames', None),
     }
     for key, value in overrides.items():
         if value is not None:
@@ -966,6 +1023,10 @@ def run(args):
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
+    config.seed = args.seed
+    random.seed(config.seed + rank)
+    np.random.seed(config.seed + rank)
+    torch.manual_seed(config.seed + rank)
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
@@ -1029,6 +1090,8 @@ def main():
         default=None,
         help="Root directory containing open-format LeRobot datasets",
     )
+    parser.add_argument("--human-gen-root", type=str, default=None,
+                        help="Prepared HumanGen root for all selected mixture sources")
     parser.add_argument("--icl-manifest-path", type=str, default=None)
     parser.add_argument("--human-latent-path", type=str, default=None)
     parser.add_argument("--robot-latent-path", type=str, default=None)
@@ -1043,6 +1106,7 @@ def main():
         action="store_true",
         help="Disable Weights & Biases logging",
     )
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--droptext-target", type=float, default=None)
     parser.add_argument("--drop-icl", type=float, default=None)
@@ -1053,6 +1117,8 @@ def main():
         "--gradient-accumulation-steps", type=int, default=None)
     parser.add_argument("--num-steps", type=int, default=None)
     parser.add_argument("--save-interval", type=int, default=None)
+    parser.add_argument("--max-train-frames", type=int, default=None,
+                        help="Optional aligned robot latent/action temporal crop; full ICL retained")
 
     args = parser.parse_args()
     run(args)

@@ -4,7 +4,7 @@ set -x
 
 umask 007
  
-NGPU=${NGPU:-"8"}
+NGPU=${NPROC_PER_NODE:-${NGPU:-"8"}}
 PYTHON_BIN=${PYTHON_BIN:-"python"}
 MASTER_PORT=${MASTER_PORT:-"29501"}
 PORT=${PORT:-"1106"}
@@ -13,10 +13,10 @@ TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 CONFIG_NAME=${CONFIG_NAME:-"robotwin_train"} # MCP is enabled for all training configs
 DATASETS=${DATASETS:-"robotwin:1.0"}
 
-# 将模型路径替换为实际位置
-export MODEL_PATH="${MODEL_PATH:-/mnt/sfs_turbo/public/ckpts/Zero-WAM/zero-wam-pretrain}"
-export ZERO_WAM_SAVE_ROOT="${ZERO_WAM_SAVE_ROOT:-/mnt/sfs_turbo/lijianwen/Codes/Zero-WAM/outputs/robotwin_train}"
+: "${MODEL_PATH:?Set MODEL_PATH to a Zero-WAM model root (released or Wan-initialized)}"
+export MODEL_PATH
 export HUMAN_GEN_ROOT="${HUMAN_GEN_ROOT:-/mnt/sfs_turbo/public/datasets/HumanGen}"
+
 
 overrides=""
 if [ $# -ne 0 ]; then

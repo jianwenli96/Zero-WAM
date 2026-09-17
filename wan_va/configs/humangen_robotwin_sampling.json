@@ -1,0 +1,14 @@
+{
+  "name": "humangen_robotwin_4to1_sqrt_tasks",
+  "humangen_to_robotwin_ratio": 4.0,
+  "task_count_exponent": 0.5,
+  "paper_task_counts": {
+    "agibot": 3354,
+    "interna1": 261,
+    "oxe": 438,
+    "robocoin": 512,
+    "robomind": 497
+  },
+  "within_source": "uniform_samples",
+  "说明": "HumanGen:RoboTwin=4:1；HumanGen 内部按论文任务数的平方根分配来源概率。任务数是论文完整集合的先验，不是本地任务统计；来源内均匀抽样，不是严格 task-balanced。RoboTwin 仅使用 43 个训练任务。"
+}

@@ -37,6 +37,20 @@
   </a>
 </p>
 
+## 昇腾开发文档
+
+- [基于 mentor 的昇腾适配与验证](docs/ascend.md)
+- [跨主机复用共享 Python 环境](docs/shared-environment.md)
+- [原始 Wan 权重转换与初始化](docs/wan-initialization.md)
+- [HumanGen 数据准备与预训练](docs/humangen-wan-training.md)
+- [RoboTwin 数据准备与训练](docs/robotwin-wan-training.md)
+
+当前 NPU 核心实现以 `jianwenli96/Zero-WAM` 的 `main_ascend`（`d9a2177`）为基线，采用 `transfer_to_npu` 和稠密 SDPA。原独立适配保存在 `backup/pre-mentor-alignment`。
+
+昇腾联合训练入口 `script/train_humangen_wan_npu.sh` 默认采用 HumanGen:RoboTwin=4:1，HumanGen 内部按论文任务数平方根加权，来源内均匀抽样。执行 `--dry-run` 查看完整命令与实际概率，`--check-only` 运行 CPU 数据检查。可用 `MAX_TRAIN_FRAMES` 显式限制机器人训练片段长度，默认不裁剪。
+
+本分支新增开发文档统一使用中文，Git commit 信息使用英文。下方保留上游项目介绍。
+
 ## Overview
 
 Zero-WAM targets zero-shot cross-task robotic manipulation, where a policy must execute tasks that were never practiced during training using only deployment-time context. It brings in-context learning to robotics by treating human demonstration videos as visual task specifications, enabling a causal video-action policy to predict future robot observations and executable actions from either language instructions or human video prompts.
@@ -283,7 +297,9 @@ Each task uses the fixed human demonstration in `evaluation/robotwin/robotwin_ic
 
 ## Training
 
-Both training modes start from the released `zero-wam-pretrain` checkpoint. Configure the model and output paths:
+从原始 Wan 基座开始训练，请先阅读 [Wan 权重初始化说明](docs/wan-initialization.md)。本地 RoboTwin 数据检查与昇腾启动入口见 [RoboTwin 训练说明](docs/robotwin-wan-training.md)；使用五个外部 HumanGen 来源或六源混训，见 [HumanGen 预训练说明](docs/humangen-wan-training.md)。
+
+下方两种官方训练模式默认从发布的 `zero-wam-pretrain` 权重开始。也可按上方说明，通过 `MODEL_PATH` 指定从 Wan 转换得到的初始化权重。模型和输出路径配置如下：
 
 ```bash
 export MODEL_PATH="${PROJECT_ROOT}/checkpoints/zero-wam-pretrain"

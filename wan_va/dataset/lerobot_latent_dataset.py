@@ -2,6 +2,8 @@
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import get_episode_data_index
 import datasets
+import pyarrow as pa
+import pyarrow.parquet as pq
 import hashlib
 import json
 import numpy as np
@@ -207,6 +209,27 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
         local_idx = idx - self.acc_dset_num[self.item_id_to_dataset_id[idx]]
         return cur_dset[local_idx]
 
+def load_action_parquets(paths, columns):
+    """Read numeric action/state columns without newer HF feature metadata.
+
+    Public external HumanGen exports use HF ``List`` metadata, unsupported by
+    LeRobot 0.3.3's datasets<=3.6 pin. Physical Arrow types retain the actual
+    numeric list layout; video and text are already loaded from latent files.
+    """
+    if not paths:
+        raise ValueError('No action parquet files selected')
+    schema = pq.read_schema(paths[0])
+    missing = set(columns) - set(schema.names)
+    if missing:
+        raise KeyError(f'Missing action columns: {sorted(missing)}')
+    features = datasets.Features.from_arrow_schema(
+        pa.schema([schema.field(column) for column in columns]))
+    return datasets.load_dataset(
+        'parquet', data_files=[str(path) for path in paths], split='train',
+        columns=list(columns), features=features,
+    )
+
+
 class LatentLeRobotDataset(LeRobotDataset):
     def __init__(
         self,
@@ -303,6 +326,13 @@ class LatentLeRobotDataset(LeRobotDataset):
         )
         if self.index_cache_hit and not self.hf_cache_hit:
             self._save_dataset_index_cache(fingerprint, self.new_metas)
+
+    def load_hf_dataset(self):
+        if self.action_processor is None:
+            return super().load_hf_dataset()
+        paths = [self.root / self.meta.get_data_file_path(episode)
+                 for episode in self.episodes]
+        return load_action_parquets(paths, self.action_processor.columns)
 
     def _dataset_index_fingerprint(self):
         return dataset_index_fingerprint(

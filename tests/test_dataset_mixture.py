@@ -1,4 +1,6 @@
 from copy import deepcopy
+import shutil
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -200,3 +202,28 @@ def test_dataset_path_override_is_rejected_for_a_mixture():
             local_rank=0,
             world_size=1,
         )
+
+
+def test_humangen_root_applies_to_every_source_without_losing_robotwin_holdout(tmp_path):
+    from wan_va.configs import TRAIN_DATASET_CONFIGS
+    config = deepcopy(va_robotwin_train_cfg)
+    stats = tmp_path / 'robotwin_data/meta/action_stats.json'
+    stats.parent.mkdir(parents=True)
+    shutil.copyfile(Path(__file__).parents[1] / 'wan_va/assets/norm_stats/robotwin_icl.json', stats)
+    manifest = tmp_path / 'icl_configs/ICL_config_robotwin_train.json'
+    manifest.parent.mkdir()
+    manifest.write_text('{}')
+    names = ['agibot', 'robocoin', 'robomind', 'interna1', 'oxe', 'robotwin']
+    sources = _build_dataset_sources(
+        config, _training_args(','.join(f'{n}:1' for n in names), human_gen_root=str(tmp_path)),
+        rank=0, local_rank=0, world_size=6)
+    for source in sources:
+        name, cfg = source['name'], source['config']
+        assert Path(cfg.dataset_path) == tmp_path / f'{name}_data'
+        assert Path(cfg.human_latent_path) == tmp_path / 'human_latents' / name
+        assert cfg.obs_cam_keys == TRAIN_DATASET_CONFIGS[name].obs_cam_keys
+        assert cfg.robot_latent_path == ''
+    assert Path(sources[-1]['config'].icl_manifest_path) == manifest
+    assert len(sources[-1]['config'].excluded_task_names) == 7
+    assert sources[-1]['config'].expected_num_train_tasks == 43
+    assert TRAIN_DATASET_CONFIGS['agibot'].dataset_path != str(tmp_path / 'agibot_data')
