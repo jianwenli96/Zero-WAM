@@ -11,6 +11,78 @@ from wan_va.modules import icl_model
 from wan_va.modules.icl_model import ICLAttentionBackend as Backend
 
 
+def test_compact_modulation_matches_dense_with_different_spatial_sizes():
+    from wan_va.modules.icl_model import (
+        FrameTimestepProjection, WanICLTransformerBlock,
+        _concat_timestep_projections,
+    )
+
+    torch.manual_seed(23)
+    values = [torch.randn(1, frames, 6, 5, requires_grad=True)
+              for frames in (2, 3)]
+    reference_values = [x.detach().clone().requires_grad_() for x in values]
+    indices = [torch.arange(frames).repeat_interleave(spatial)
+               for frames, spatial in ((2, 3), (3, 2))]
+    compact = _concat_timestep_projections([
+        FrameTimestepProjection(x, ids) for x, ids in zip(values, indices)])
+    dense = torch.cat([x.index_select(1, ids)
+                       for x, ids in zip(reference_values, indices)], dim=1)
+    table = torch.randn(1, 6, 5, requires_grad=True)
+    reference_table = table.detach().clone().requires_grad_()
+    actual = WanICLTransformerBlock._modulation(table, compact)
+    expected = WanICLTransformerBlock._modulation(reference_table, dense)
+    weights = torch.randn(6, 1, 12, 5)
+    actual_loss = expected_loss = 0
+    for i in range(6):
+        torch.testing.assert_close(actual[i], expected[i], rtol=0, atol=0)
+        actual_loss = actual_loss + (actual[i] * weights[i]).square().sum()
+        expected_loss = expected_loss + (expected[i] * weights[i]).square().sum()
+    actual_loss.backward()
+    expected_loss.backward()
+    for a, b in zip([table, *values], [reference_table, *reference_values]):
+        torch.testing.assert_close(a.grad, b.grad)
+
+
+@pytest.mark.parametrize('mode', ['video', 'action'])
+def test_frame_timestep_embedding_matches_token_outputs_and_gradients(mode):
+    from test_icl_model import _tiny_model
+
+    torch.manual_seed(41)
+    model = _tiny_model('cpu').float().train()
+    embedder = (model.condition_embedder if mode == 'video'
+                else model.condition_embedder_action)
+    reference = deepcopy(embedder)
+    channels = 4 if mode == 'video' else 3
+    # Different times per frame and different upstream gradients per token:
+    # this checks that spatial broadcasting accumulates parameter gradients.
+    times = torch.tensor([[0., 100., 900.]])
+    stream = dict(noisy_latents=torch.randn(1, channels, 3, 2, 2),
+                  timesteps=times)
+    rows = []
+    hook = embedder.register_forward_pre_hook(
+        lambda module, args: rows.append(args[0].numel()))
+    _, temb, proj = model._embed_stream(stream, mode)
+    proj = proj.materialize()
+    hook.remove()
+    expected_temb, expected_proj = reference(times.repeat_interleave(4, dim=1),
+                                             dtype=torch.float32)
+    expected_proj = expected_proj.unflatten(2, (6, -1))
+    assert rows == [3]
+    torch.testing.assert_close(temb, expected_temb)
+    torch.testing.assert_close(proj, expected_proj)
+    weights = [torch.randn_like(temb), torch.randn_like(proj)]
+    ((temb * weights[0]).sum() + (proj * weights[1]).sum()).backward()
+    ((expected_temb * weights[0]).sum()
+     + (expected_proj * weights[1]).sum()).backward()
+    for (name, param), (_, expected) in zip(embedder.named_parameters(),
+                                           reference.named_parameters()):
+        if expected.grad is None:
+            assert param.grad is None, name
+        else:
+            torch.testing.assert_close(param.grad, expected.grad,
+                                       atol=2e-5, rtol=2e-4, msg=name)
+
+
 def test_tiled_training_and_streaming_masks_match_dense(monkeypatch):
     torch.manual_seed(9)
     seq = torch.tensor([0, 0, 0, 1, 1, -1, 0, 1, 0, -1])
@@ -77,33 +149,45 @@ def test_cost_reader_uses_latent_shapes_and_full_human_prompt(tmp_path):
         2*(64*7*9*2+64*16)+46*9*16]
 
 
-def test_shared_mcp_masks_preserve_outputs_and_gradients_across_depths():
+@pytest.mark.parametrize('dense_projection', [False, True])
+def test_shared_mcp_masks_preserve_outputs_and_gradients_across_depths(dense_projection):
     from wan_va.utils import get_mesh_id
     from wan_va.modules.icl_model import WanICLTransformer3DModel
     torch.manual_seed(17)
+    dtype = torch.bfloat16
     model = WanICLTransformer3DModel(
         patch_size=(1,1,1),num_attention_heads=2,attention_head_dim=18,
         in_channels=4,out_channels=4,action_dim=3,text_dim=8,freq_dim=4,
         ffn_dim=16,num_layers=1,rope_max_seq_len=32,action_inner_dim=36,
         action_ffn_dim=16,attn_window=4,enable_mcp=True,num_mcp_modules=2,
         mcp_hidden_collect_layers=(0,),
-    ).to(dtype=torch.bfloat16).train()
+    ).to(dtype=dtype).train()
     reference=deepcopy(model)
+    if dense_projection:
+        from wan_va.distributed.fsdp import apply_ac
+        embed = reference._embed_stream
+        def dense_embed(*args, **kwargs):
+            hidden, temb, projection = embed(*args, **kwargs)
+            return hidden, temb, projection.materialize()
+        reference._embed_stream = dense_embed
+        # Exercise the compact pytree through the production checkpoint wrapper.
+        apply_ac(model)
+        apply_ac(reference)
     set_masks=reference._set_masks
     # Independent storage per depth is the pre-optimization lifetime behavior.
     reference._set_masks=lambda blocks,self_mask,cross_mask: set_masks(
         blocks,self_mask.clone(),cross_mask.clone())
     def stream(channels,action=False,shift=0):
-        data=torch.randn(1,channels,2,2,1,dtype=torch.bfloat16)
+        data=torch.randn(1,channels,2,2,1,dtype=dtype)
         grid=get_mesh_id(2,2,1,int(action),f_shift=shift,action=False)[None]
-        return dict(noisy_latents=data,latent=data.clone(),timesteps=torch.zeros(1,2),
+        return dict(noisy_latents=data,latent=data.clone(),timesteps=torch.tensor([[10.,700.]]),
                     cond_timesteps=torch.zeros(1,2),grid_id=grid)
     robot=stream(4);action=stream(3,True)
     inputs=dict(latent_dict=robot,action_dict=action,
                 icl_latent_dict=dict(latent=robot['latent'],timesteps=torch.zeros(1,2),
                                      grid_id=robot['grid_id']),
                 mcp_latent_dicts=[stream(4,shift=2),stream(4,shift=4)],
-                text_emb=torch.randn(1,4,8,dtype=torch.bfloat16),
+                text_emb=torch.randn(1,4,8,dtype=dtype),
                 encoder_seq_ids=torch.tensor([0,0,1,1]),chunk_size=2,
                 max_frame_chunk_size=4,window_size=4)
     out=model(deepcopy(inputs),train_mode=True)
@@ -117,7 +201,9 @@ def test_shared_mcp_masks_preserve_outputs_and_gradients_across_depths():
     for a,b in zip(model.parameters(),reference.parameters()):
         if a.grad is not None:
             assert torch.isfinite(a.grad).all()
-            torch.testing.assert_close(a.grad,b.grad,rtol=0,atol=0)
+            torch.testing.assert_close(a.grad,b.grad,
+                                       rtol=0.02 if dense_projection else 0,
+                                       atol=2e-3 if dense_projection else 0)
     first=model.mcp_blocks[0][0].attn1.self_block_mask
     assert first is model.mcp_blocks[1][0].attn1.self_block_mask
     model(deepcopy(inputs),train_mode=True)

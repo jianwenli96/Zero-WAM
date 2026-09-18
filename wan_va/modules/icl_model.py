@@ -10,7 +10,7 @@ directly.
 
 import math
 from copy import deepcopy
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 import torch.nn as nn
@@ -36,6 +36,46 @@ _DENSE_MASK_TILE_ELEMENTS = 4 * 1024 * 1024
 ICL_CACHE_TYPE = 2
 PREDICTION_CACHE_TYPE = 1
 OBSERVATION_CACHE_TYPE = 0
+
+
+class FrameTimestepProjection(NamedTuple):
+    """Frame-sized AdaLN values and their spatial token mapping.
+
+    A named tuple keeps tensors visible to checkpoint/FSDP pytree traversal.
+    Model parameters and checkpoint keys are unchanged.
+    """
+
+    values: torch.Tensor
+    token_frame_ids: torch.Tensor
+
+    def materialize(self):
+        return self.values.index_select(1, self.token_frame_ids)
+
+
+def _concat_timestep_projections(parts):
+    # Dense tensors remain supported for callers using pre-expanded embeddings.
+    if isinstance(parts[0], torch.Tensor):
+        return torch.cat(parts, dim=1)
+    indices = []
+    offset = 0
+    for part in parts:
+        indices.append(part.token_frame_ids + offset)
+        offset += part.values.shape[1]
+    return FrameTimestepProjection(
+        torch.cat([part.values for part in parts], dim=1), torch.cat(indices)
+    )
+
+
+class _FrameModulation:
+    """Expand only the requested shift, scale or gate, never all six at once."""
+
+    def __init__(self, table, projection):
+        self.values = table[None] + projection.values.float()
+        self.token_frame_ids = projection.token_frame_ids
+
+    def __getitem__(self, index):
+        return self.values[:, :, index].index_select(1, self.token_frame_ids)
+
 
 _compiled_flex_attention = torch.compile(flex_attention, dynamic=True)
 _compiled_create_block_mask = torch.compile(create_block_mask)
@@ -551,6 +591,8 @@ class WanICLTransformerBlock(nn.Module):
 
     @staticmethod
     def _modulation(table, temb):
+        if isinstance(temb, FrameTimestepProjection):
+            return _FrameModulation(table, temb)
         values = table[None] + temb.float()
         return values.unbind(dim=2)
 
@@ -560,8 +602,8 @@ class WanICLTransformerBlock(nn.Module):
         hs_action: Optional[torch.Tensor],
         hs_pad: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        temb_latent: Optional[torch.Tensor],
-        temb_action: Optional[torch.Tensor],
+        temb_latent: Optional[torch.Tensor | FrameTimestepProjection],
+        temb_action: Optional[torch.Tensor | FrameTimestepProjection],
         rotary_emb: torch.Tensor,
         update_cache: int = 0,
         cache_name: str = "pos",
@@ -848,11 +890,20 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
         timesteps = stream["timesteps"]
         if timesteps.ndim == 1:
             timesteps = timesteps[None]
-        token_timesteps = torch.repeat_interleave(timesteps, repeats, dim=1)
+        # Every spatial token in a latent frame shares its timestep. Run the
+        # trainable MLP once per frame, then broadcast its outputs; autograd
+        # sums the repeated tokens' contributions back into the frame rows.
         temb, timestep_proj = condition_embedder(
-            token_timesteps, dtype=hidden_states.dtype
+            timesteps, dtype=hidden_states.dtype
         )
-        return hidden_states, temb, timestep_proj.unflatten(2, (6, -1))
+        temb = torch.repeat_interleave(temb, repeats, dim=1)
+        token_frame_ids = torch.arange(
+            timesteps.shape[1], device=timesteps.device
+        ).repeat_interleave(repeats)
+        projection = FrameTimestepProjection(
+            timestep_proj.unflatten(2, (6, -1)), token_frame_ids
+        )
+        return hidden_states, temb, projection
 
     def _append_metadata(
         self,
@@ -1020,8 +1071,8 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
             else:
                 self._set_masks(group, *mcp_masks)
 
-            mcp_timestep_proj = torch.cat(
-                [future_timestep_proj, target_clean_timestep_proj], dim=1
+            mcp_timestep_proj = _concat_timestep_projections(
+                [future_timestep_proj, target_clean_timestep_proj]
             )
             for block in group:
                 mcp_hs, mcp_action = block(
@@ -1098,9 +1149,9 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
 
         hs_latent = torch.cat(latent_parts, dim=1)
         hs_action = torch.cat([action_noisy_hs, action_clean_hs], dim=1)
-        latent_timestep_proj = torch.cat(latent_timestep_parts, dim=1)
-        action_timestep_proj = torch.cat(
-            [action_noisy_timestep_proj, action_clean_timestep_proj], dim=1
+        latent_timestep_proj = _concat_timestep_projections(latent_timestep_parts)
+        action_timestep_proj = _concat_timestep_projections(
+            [action_noisy_timestep_proj, action_clean_timestep_proj]
         )
         target_grid = latent["grid_id"][0]
         action_grid = action["grid_id"][0]
