@@ -12,6 +12,15 @@ if [[ -v DATASETS ]]; then
   SAMPLING_ARGS+=(--datasets "$DATASETS")
 fi
 DATASETS=$("$PYTHON_BIN" script/resolve_training_sampling.py "${SAMPLING_ARGS[@]}")
+# Group the same weighted draws by post-crop cost. Single-source training
+# currently uses DistributedSampler and does not support length bucketing.
+if [[ ! -v LENGTH_BUCKET_STEPS ]]; then
+  if [[ "$DATASETS" == *,* ]]; then
+    LENGTH_BUCKET_STEPS=10
+  else
+    LENGTH_BUCKET_STEPS=0
+  fi
+fi
 export ZERO_WAM_SAVE_ROOT=${ZERO_WAM_SAVE_ROOT:-"$ROOT/train_out/wan-humangen-robotwin-4to1-sqrt-seed42-pilot"}
 export HF_HOME=${HF_HOME:-"$ROOT/outputs/hf-cache"}
 export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-"$HF_HOME/datasets"}
@@ -44,7 +53,7 @@ if [[ -n "${ASCEND_RT_VISIBLE_DEVICES:-}" ]]; then
   NPROC_PER_NODE=${NPROC_PER_NODE:-${#CARDS[@]}}
   [[ "$NPROC_PER_NODE" -eq "${#CARDS[@]}" ]] || { echo 'NPROC_PER_NODE must match assigned visible devices' >&2; exit 1; }
 else
-  NPROC_PER_NODE=${NPROC_PER_NODE:-6}
+  NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 fi
 TRAIN_MODULE=wan_va.train
 if [[ "${TRAIN_DIAGNOSTICS:-0}" == 1 ]]; then
@@ -57,7 +66,8 @@ COMMAND=("$PYTHON_BIN" -m torch.distributed.run --nproc_per_node "$NPROC_PER_NOD
   --save-root "$ZERO_WAM_SAVE_ROOT" --seed "${TRAIN_SEED:-42}"
   --num-steps "${NUM_STEPS:-10}" --save-interval "${SAVE_INTERVAL:-10}"
   --batch-size 1 --gradient-accumulation-steps "${GRAD_ACCUM:-1}"
-  --init-worker "${INIT_WORKERS:-4}" --load-worker "${LOAD_WORKERS:-2}"
+  --init-worker "${INIT_WORKERS:-1}" --load-worker "${LOAD_WORKERS:-2}"
+  --fsdp-granularity "${FSDP_GRANULARITY:-sublayer}"
   --learning-rate "${LEARNING_RATE:-0.0001}" --drop-icl 0.1 --droptext-target 0.4
   --disable-wandb)
 # The empirical profile is calibrated only for the eight-card configuration.
@@ -74,9 +84,6 @@ if [[ -n "${MAX_TRAIN_FRAMES:-}" ]]; then
 fi
 if [[ -n "${LENGTH_BUCKET_STEPS:-}" ]]; then
   COMMAND+=(--length-bucket-steps "$LENGTH_BUCKET_STEPS")
-fi
-if [[ -n "${FSDP_GRANULARITY:-}" ]]; then
-  COMMAND+=(--fsdp-granularity "$FSDP_GRANULARITY")
 fi
 if [[ "$MODE" == --dry-run ]]; then
   "$PYTHON_BIN" script/resolve_training_sampling.py "${SAMPLING_ARGS[@]}" --output-format json

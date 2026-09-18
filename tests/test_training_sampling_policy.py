@@ -63,13 +63,19 @@ def test_launcher_uses_resolved_policy_without_loading_npu(tmp_path):
         file.parent.mkdir(parents=True, exist_ok=True)
         file.write_text('{}')
     env = dict(os.environ, MODEL_PATH=str(model), HUMANGEN_ROOT=str(data), PYTHON_BIN=sys.executable)
-    for key in ('DATASETS', 'SAMPLING_CONFIG', 'ASCEND_RT_VISIBLE_DEVICES', 'NPROC_PER_NODE'):
+    for key in ('DATASETS', 'SAMPLING_CONFIG', 'ASCEND_RT_VISIBLE_DEVICES', 'NPROC_PER_NODE',
+                'INIT_WORKERS', 'LENGTH_BUCKET_STEPS', 'SEQUENCE_CAPACITY_PROFILE',
+                'FSDP_GRANULARITY'):
         env.pop(key, None)
     result = subprocess.run(['bash', str(root / 'script/train_humangen_wan_npu.sh'), '--dry-run'],
                             env=env, capture_output=True, text=True, check=True)
     report, _ = json.JSONDecoder().raw_decode(result.stdout)
     assert report['source_probabilities'] == resolve()['source_probabilities']
-    assert '--nproc_per_node 6' in result.stdout
+    assert '--nproc_per_node 8' in result.stdout
+    assert '--init-worker 1' in result.stdout
+    assert '--length-bucket-steps 10' in result.stdout
+    assert '--sequence-capacity-profile' in result.stdout
+    assert '--fsdp-granularity sublayer' in result.stdout
     assert '--human-gen-root' in result.stdout
     assert not (tmp_path / 'data/validation.json').exists()
 
@@ -93,3 +99,30 @@ def test_launcher_capacity_profile_only_defaults_to_eight_cards(tmp_path, cards,
     assert ('--sequence-capacity-profile' in result.stdout) is enabled
     if enabled:
         assert 'sequence_capacity_8npu.json' in result.stdout
+
+
+@pytest.mark.parametrize('datasets,override,expected', [
+    ('agibot:1', None, 0),
+    ('agibot:1,interna1:1', None, 10),
+    ('agibot:1,interna1:1', '0', 0),
+    ('agibot:1,interna1:1', '20', 20),
+])
+def test_launcher_bucketing_matches_source_mode_and_explicit_override(
+        tmp_path, datasets, override, expected):
+    root = Path(__file__).parents[1]
+    model, data = tmp_path / 'model', tmp_path / 'data'
+    for file in [model / 'transformer/config.json', model / 'initialization.json',
+                 data / 'external-preparation.json']:
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text('{}')
+    env = dict(os.environ, MODEL_PATH=str(model), HUMANGEN_ROOT=str(data),
+               PYTHON_BIN=sys.executable, DATASETS=datasets)
+    for key in ('LENGTH_BUCKET_STEPS', 'ASCEND_RT_VISIBLE_DEVICES', 'NPROC_PER_NODE',
+                'SAMPLING_CONFIG'):
+        env.pop(key, None)
+    if override is not None:
+        env['LENGTH_BUCKET_STEPS'] = override
+    result = subprocess.run(
+        ['bash', str(root / 'script/train_humangen_wan_npu.sh'), '--dry-run'],
+        env=env, capture_output=True, text=True, check=True)
+    assert f'--length-bucket-steps {expected}' in result.stdout
