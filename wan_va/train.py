@@ -4,6 +4,7 @@ import time
 import random
 import numpy as np
 from copy import deepcopy
+from functools import partial
 import os
 from pathlib import Path
 import wandb
@@ -54,6 +55,8 @@ from .utils import (
 )
 
 from .dataset.humangen_paths import configure_humangen_source
+from .dataset.sample_costs import training_sample_costs
+from .dataset.sequence_crop import SequenceCapacity, crop_training_batch
 
 from .dataset import (
     DistributedDatasetMixtureSampler,
@@ -71,25 +74,6 @@ def _safe_mean(tensor):
     return tensor.sum() / max(tensor.numel(), 1)
 
 
-def crop_training_batch(batch, max_frames):
-    """Crop aligned robot latent/action frames; preserve the full ICL prompt."""
-    if max_frames is None:
-        return batch
-    if max_frames <= 0:
-        raise ValueError('max_train_frames must be positive')
-    frames = batch['latents'].shape[2]
-    for key in ('actions', 'actions_mask'):
-        if batch[key].shape[2] != frames:
-            raise ValueError(f'{key} does not align with robot latent frames')
-    if frames <= max_frames:
-        return batch
-    start = torch.randint(frames - max_frames + 1, (1,)).item()
-    cropped = dict(batch)
-    for key in ('latents', 'actions', 'actions_mask'):
-        cropped[key] = batch[key][:, :, start:start + max_frames].contiguous()
-    return cropped
-
-
 _DATASET_PATH_OVERRIDES = (
     'dataset_path',
     'icl_manifest_path',
@@ -103,6 +87,11 @@ def _build_dataset_sources(config, args, rank, local_rank, world_size):
         args.datasets,
         available_names=TRAIN_DATASET_CONFIGS,
     )
+    bucket_steps = getattr(args, 'length_bucket_steps', 0)
+    if bucket_steps < 0:
+        raise ValueError('length_bucket_steps must be nonnegative')
+    if bucket_steps and len(entries) == 1:
+        raise ValueError('Length bucketing currently requires a weighted dataset mixture')
     path_overrides = {
         key: getattr(args, key)
         for key in _DATASET_PATH_OVERRIDES
@@ -224,6 +213,12 @@ class Trainer:
             raise ValueError(
                 "Zero-WAM ICL training requires batch_size=1 per rank"
             )
+        profile_path = getattr(config, 'sequence_capacity_profile', None)
+        self.capacity_profile = SequenceCapacity.load(profile_path) if profile_path else None
+        if self.capacity_profile is not None:
+            self.capacity_profile.validate_training(config)
+            logger.info('Random robot window capacity: %s (full human condition retained)',
+                        self.capacity_profile.name)
         if self.enable_mcp:
             validate_mcp_settings(
                 num_mcp_modules=config.num_mcp_modules,
@@ -245,6 +240,9 @@ class Trainer:
         else:
             transformer_path = self._resolve_transformer_path(config.model_path)
 
+        if self.capacity_profile is not None:
+            self.capacity_profile.validate_model(json.loads(
+                (Path(transformer_path) / 'config.json').read_text()))
         self.transformer = load_transformer(
             transformer_path,
             torch_dtype=torch.float32,
@@ -275,7 +273,8 @@ class Trainer:
         apply_ac(self.transformer)
 
         logger.info("Setting up FSDP...")
-        shard_fn = shard_model
+        shard_fn = partial(shard_model, granularity=getattr(
+            config, 'fsdp_granularity', 'sublayer'))
         self.transformer = _configure_model(
             model=self.transformer,
             shard_fn=shard_fn,
@@ -370,6 +369,39 @@ class Trainer:
                 train_dataset.index_cache_misses,
             )
             logger.info("Dataset sampling probabilities: %s", mixture)
+        bucket_steps = int(getattr(config, 'length_bucket_steps', 0))
+        if bucket_steps < 0:
+            raise ValueError('length_bucket_steps must be nonnegative')
+        if bucket_steps and len(dataset_sources) == 1:
+            raise ValueError('Length bucketing currently requires a weighted dataset mixture')
+        sample_costs = None
+        if bucket_steps:
+            cost_tensor = torch.zeros(len(train_dataset), device=self.device,
+                                      dtype=torch.float32)
+            cost_error = torch.zeros(1, device=self.device, dtype=torch.int)
+            if config.rank == 0:
+                try:
+                    cost_started = time.perf_counter()
+                    sample_costs = training_sample_costs(
+                        train_dataset, getattr(config, 'max_train_frames', None),
+                        self.patch_size,
+                        capacity=self.capacity_profile,
+                    )
+                    cost_tensor.copy_(torch.tensor(sample_costs, device=self.device))
+                    logger.info('Built %d sample costs in %.2fs; bucket window=%d steps',
+                                len(sample_costs), time.perf_counter() - cost_started,
+                                bucket_steps)
+                except Exception:
+                    logger.exception('Could not build sample costs')
+                    cost_error.fill_(1)
+            if dist.is_initialized():
+                dist.broadcast(cost_error, src=0)
+            if cost_error.item():
+                raise RuntimeError('Sample cost indexing failed; see rank zero log')
+            if dist.is_initialized():
+                dist.broadcast(cost_tensor, src=0)
+            sample_costs = cost_tensor.cpu().tolist()
+            del cost_tensor, cost_error
         if len(dataset_sources) > 1:
             train_sampler = DistributedDatasetMixtureSampler(
                 dataset_lengths=train_dataset.dataset_lengths,
@@ -377,6 +409,8 @@ class Trainer:
                 num_replicas=config.world_size,
                 rank=config.rank,
                 seed=getattr(config, 'seed', 42),
+                sample_costs=sample_costs,
+                bucket_steps=bucket_steps,
             )
         elif config.world_size > 1:
             train_sampler = DistributedSampler(
@@ -696,7 +730,12 @@ class Trainer:
 
     def _train_step(self, batch, batch_idx):
         """Train a single batch, returns losses for logging."""
-        batch = crop_training_batch(batch, getattr(self.config, 'max_train_frames', None))
+        batch = crop_training_batch(
+            batch, getattr(self.config, 'max_train_frames', None),
+            capacity=getattr(self, 'capacity_profile', None))
+        window_crop = batch.get('_window_crop')
+        if window_crop is not None:
+            logger.info('Random robot window rank=%s: %s', self.config.rank, window_crop)
         batch = self.convert_input_format(batch)
         input_dict = self._prepare_input_dict(batch)
         
@@ -724,6 +763,7 @@ class Trainer:
             'action_loss': action_loss.detach(),
             'mcp_losses': [depth_loss.detach() for depth_loss in mcp_losses],
             'mcp_loss': mcp_loss.detach(),
+            'window_crop': window_crop,
         }
         
         # Only update weights after accumulating gradients
@@ -952,6 +992,7 @@ class Trainer:
                         'total_loss': latent_loss_show + action_loss_show + mcp_total_loss_show,
                         'step_seconds': step_seconds,
                         'rank0_data_seconds': data_seconds,
+                        'rank0_window_crop': losses.get('window_crop'),
                     }
                     with (Path(self.config.save_root) / 'metrics.jsonl').open('a') as handle:
                         handle.write(json.dumps(metrics) + '\n')
@@ -1011,6 +1052,9 @@ def run(args):
         'save_interval': args.save_interval,
         'save_root': args.save_root,
         'max_train_frames': getattr(args, 'max_train_frames', None),
+        'sequence_capacity_profile': getattr(args, 'sequence_capacity_profile', None),
+        'length_bucket_steps': getattr(args, 'length_bucket_steps', 0),
+        'fsdp_granularity': getattr(args, 'fsdp_granularity', 'sublayer'),
     }
     for key, value in overrides.items():
         if value is not None:
@@ -1119,6 +1163,12 @@ def main():
     parser.add_argument("--save-interval", type=int, default=None)
     parser.add_argument("--max-train-frames", type=int, default=None,
                         help="Optional aligned robot latent/action temporal crop; full ICL retained")
+    parser.add_argument('--sequence-capacity-profile', default=None,
+                        help='JSON capacity profile for shape-aware random robot windows; full human condition retained')
+    parser.add_argument('--length-bucket-steps', type=int, default=0,
+                        help='Group similar-cost samples within this many distributed microbatches (0 disables; mixtures only)')
+    parser.add_argument('--fsdp-granularity', choices=['sublayer', 'block'],
+                        default='sublayer', help='FSDP2 grouping: block reduces collective count')
 
     args = parser.parse_args()
     run(args)

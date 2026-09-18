@@ -94,6 +94,10 @@ bash script/train_humangen_wan_npu.sh --dry-run
 
 覆盖后报告中的策略名为 `custom_DATASETS`，实际概率重新归一化，不再使用默认 4:1 配比。无效、重复、非正或非有限权重会在启动分布式进程前报错。
 
+## 长序列与显存
+
+8 卡启动时默认启用按容量随机窗口裁剪：保留全部样本及完整人类示范，仅对超预算的机器人视频、动作和掩码同步裁剪。其他卡数不自动使用该容量配置，可设置 `MAX_TRAIN_FRAMES`。启用方式、适用配置、数据影响与实测依据统一见[训练显存与长序列处理](training-memory.md)。
+
 ## 与论文训练范围的区别
 
 公开的 HumanGen 外部 ICL 子集不等于论文完整的预训练数据。论文还使用了 Task-diverse VA 和内部 HumanGen 数据。论文中的 `VA:HumanGen = 1:5` 无法通过调整这五个外部来源的采样权重来复现。论文 RoboTwin 后训练的比例是 `VA:HumanGen:RoboTwin = 2:10:3`；当前的 HumanGen:RoboTwin=4:1 是接近其中两者相对比例的实验选择，不是原始配方。

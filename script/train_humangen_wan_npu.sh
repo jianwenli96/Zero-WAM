@@ -46,8 +46,12 @@ if [[ -n "${ASCEND_RT_VISIBLE_DEVICES:-}" ]]; then
 else
   NPROC_PER_NODE=${NPROC_PER_NODE:-6}
 fi
+TRAIN_MODULE=wan_va.train
+if [[ "${TRAIN_DIAGNOSTICS:-0}" == 1 ]]; then
+  TRAIN_MODULE=script.benchmark_npu_training
+fi
 COMMAND=("$PYTHON_BIN" -m torch.distributed.run --nproc_per_node "$NPROC_PER_NODE"
-  --master_port "${MASTER_PORT:-29617}" --tee 3 -m wan_va.train
+  --master_port "${MASTER_PORT:-29617}" --tee 3 -m "$TRAIN_MODULE"
   --config-name agibot_train --datasets "$DATASETS"
   --model-path "$MODEL_PATH" --human-gen-root "$HUMANGEN_ROOT"
   --save-root "$ZERO_WAM_SAVE_ROOT" --seed "${TRAIN_SEED:-42}"
@@ -56,8 +60,23 @@ COMMAND=("$PYTHON_BIN" -m torch.distributed.run --nproc_per_node "$NPROC_PER_NOD
   --init-worker "${INIT_WORKERS:-4}" --load-worker "${LOAD_WORKERS:-2}"
   --learning-rate "${LEARNING_RATE:-0.0001}" --drop-icl 0.1 --droptext-target 0.4
   --disable-wandb)
+# The empirical profile is calibrated only for the eight-card configuration.
+# Explicit 'off' preserves uncropped training (or a manual MAX_TRAIN_FRAMES cap).
+CAPACITY_PROFILE=${SEQUENCE_CAPACITY_PROFILE:-}
+if [[ ! -v SEQUENCE_CAPACITY_PROFILE && "$NPROC_PER_NODE" -eq 8 ]]; then
+  CAPACITY_PROFILE="$ROOT/wan_va/configs/sequence_capacity_8npu.json"
+fi
+if [[ -n "$CAPACITY_PROFILE" && "$CAPACITY_PROFILE" != off ]]; then
+  COMMAND+=(--sequence-capacity-profile "$CAPACITY_PROFILE")
+fi
 if [[ -n "${MAX_TRAIN_FRAMES:-}" ]]; then
   COMMAND+=(--max-train-frames "$MAX_TRAIN_FRAMES")
+fi
+if [[ -n "${LENGTH_BUCKET_STEPS:-}" ]]; then
+  COMMAND+=(--length-bucket-steps "$LENGTH_BUCKET_STEPS")
+fi
+if [[ -n "${FSDP_GRANULARITY:-}" ]]; then
+  COMMAND+=(--fsdp-granularity "$FSDP_GRANULARITY")
 fi
 if [[ "$MODE" == --dry-run ]]; then
   "$PYTHON_BIN" script/resolve_training_sampling.py "${SAMPLING_ARGS[@]}" --output-format json

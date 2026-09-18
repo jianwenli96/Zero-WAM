@@ -72,3 +72,24 @@ def test_launcher_uses_resolved_policy_without_loading_npu(tmp_path):
     assert '--nproc_per_node 6' in result.stdout
     assert '--human-gen-root' in result.stdout
     assert not (tmp_path / 'data/validation.json').exists()
+
+
+@pytest.mark.parametrize('cards,override,enabled', [(8, None, True), (8, 'off', False), (7, None, False)])
+def test_launcher_capacity_profile_only_defaults_to_eight_cards(tmp_path, cards, override, enabled):
+    root = Path(__file__).parents[1]
+    model, data = tmp_path / 'model', tmp_path / 'data'
+    for file in [model / 'transformer/config.json', model / 'initialization.json',
+                 data / 'external-preparation.json']:
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text('{}')
+    env = dict(os.environ, MODEL_PATH=str(model), HUMANGEN_ROOT=str(data),
+               PYTHON_BIN=sys.executable, DATASETS='agibot:1',
+               NPROC_PER_NODE=str(cards), ASCEND_RT_VISIBLE_DEVICES=','.join(map(str, range(cards))))
+    env.pop('SEQUENCE_CAPACITY_PROFILE', None)
+    if override is not None:
+        env['SEQUENCE_CAPACITY_PROFILE'] = override
+    result = subprocess.run(['bash', str(root / 'script/train_humangen_wan_npu.sh'), '--dry-run'],
+                            env=env, capture_output=True, text=True, check=True)
+    assert ('--sequence-capacity-profile' in result.stdout) is enabled
+    if enabled:
+        assert 'sequence_capacity_8npu.json' in result.stdout

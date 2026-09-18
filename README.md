@@ -43,6 +43,7 @@
 - [跨主机复用共享 Python 环境](docs/shared-environment.md)
 - [原始 Wan 权重转换与初始化](docs/wan-initialization.md)
 - [HumanGen 数据准备与预训练](docs/humangen-wan-training.md)
+- [训练显存、长序列裁剪与性能](docs/training-memory.md)
 - [RoboTwin 数据准备与训练](docs/robotwin-wan-training.md)
 
 当前 NPU 核心实现以 `jianwenli96/Zero-WAM` 的 `main_ascend`（`d9a2177`）为基线，采用 `transfer_to_npu` 和稠密 SDPA。原独立适配保存在 `backup/pre-mentor-alignment`。

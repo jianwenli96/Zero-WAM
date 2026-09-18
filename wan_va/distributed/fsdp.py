@@ -23,7 +23,10 @@ def apply_ac(model):
 
 def shard_model(model,
                 param_dtype=torch.bfloat16,
-                reduce_dtype=torch.float32):
+                reduce_dtype=torch.float32,
+                granularity="sublayer"):
+    if granularity not in ("sublayer", "block"):
+        raise ValueError('FSDP granularity must be sublayer or block')
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
@@ -32,17 +35,19 @@ def shard_model(model,
     fsdp_config = {"mp_policy": mp_policy, "reshard_after_forward": True}
 
     for block in model.blocks:
-        fully_shard(block.attn1, **fsdp_config)
-        fully_shard(block.attn2, **fsdp_config)
-        fully_shard(block.ffn, **fsdp_config)
+        if granularity == "sublayer":
+            fully_shard(block.attn1, **fsdp_config)
+            fully_shard(block.attn2, **fsdp_config)
+            fully_shard(block.ffn, **fsdp_config)
         fully_shard(block, **fsdp_config)
 
     if getattr(model, 'enable_mcp', False):
         for mcp_group in model.mcp_blocks:
             for block in mcp_group:
-                fully_shard(block.attn1, **fsdp_config)
-                fully_shard(block.attn2, **fsdp_config)
-                fully_shard(block.ffn, **fsdp_config)
+                if granularity == "sublayer":
+                    fully_shard(block.attn1, **fsdp_config)
+                    fully_shard(block.attn2, **fsdp_config)
+                    fully_shard(block.ffn, **fsdp_config)
                 fully_shard(block, **fsdp_config)
 
     fully_shard(model, **fsdp_config)

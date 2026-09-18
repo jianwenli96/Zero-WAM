@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "name": "ascend910b3-8-fsdp2-20260918-margin5pct",
+  "description": "Observed passing R/H frontier on optimized dev, 8x64GiB Ascend 910B3. R is robot video + action tokens, H is full human video tokens. 5% robot-token headroom is a conservative heuristic, not a memory guarantee. Source: docs/training-memory.md. Contended runs 004/005 excluded.",
+  "patch_size": [1, 2, 2],
+  "robot_token_margin": 0.05,
+  "training": {
+    "world_size": 8,
+    "batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "param_dtype": "torch.bfloat16",
+    "enable_mcp": true,
+    "num_mcp_modules": 4,
+    "mcp_blocks_per_group": 1,
+    "fsdp_granularity": "sublayer"
+  },
+  "model": {
+    "patch_size": [1, 2, 2],
+    "num_layers": 30,
+    "num_attention_heads": 24,
+    "attention_head_dim": 128,
+    "in_channels": 48,
+    "out_channels": 48,
+    "ffn_dim": 14336,
+    "action_dim": 30,
+    "action_inner_dim": 3072,
+    "action_ffn_dim": 14336,
+    "fully_share": false,
+    "attn_moe": true
+  },
+  "passing_points": [
+    {"robot_tokens": 19700, "human_tokens": 2240, "evidence": "boundaries: robocoin/robomind H16 R100, robot14x54 action8, human20x28"},
+    {"robot_tokens": 19475, "human_tokens": 2520, "evidence": "batch003: robocoin H18 R95, robot14x54 action16, human20x28"},
+    {"robot_tokens": 19364, "human_tokens": 3600, "evidence": "batch003: robocoin H25 R94, robot12x66 action8, human18x32"},
+    {"robot_tokens": 19320, "human_tokens": 4464, "evidence": "boundaries: interna1 H31 R92, robot12x66 action12, human18x32"},
+    {"robot_tokens": 19158, "human_tokens": 6624, "evidence": "batch003: robocoin H46 R93, robot12x66 action8, human18x32"}
+  ]
+}
