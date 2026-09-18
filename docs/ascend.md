@@ -1,56 +1,30 @@
-# 昇腾实现：以 mentor 分支为基线
+# 昇腾训练实现
 
-当前开发分支 `lianjie/mentor-aligned` 基于 `mentor/main_ascend` 的
-`d9a2177`（Adapt to NPU for core models）。原有独立 NPU 适配保存在
-`backup/pre-mentor-alignment` 和 `lianjie/ascend-training`。
+当前 `lianjie-dev` 交付分支保留与 mentor `main_ascend`（`d9a2177`）对齐的设备迁移方式，并加入已实现的显存、数据与训练功能。Git 历史中的 NPU 适配提交为 `878e40c`；这里的“对齐”描述实现来源，不表示当前核心文件与 mentor 分支逐字相同。集群启动统一见 [八卡交接说明](cluster-training.md)。
 
-## 核心实现
+## 当前实现
 
-- 训练、推理入口沿用 mentor 的 `torch_npu.contrib.transfer_to_npu`，由迁移层
-  转换 CUDA 设备、同步和分布式调用；不再使用本地 `runtime.py`。
-- ICL 注意力沿用完整稠密布尔 mask + SDPA；CUDA 分支使用 FlexAttention。
-  不再包含 query 分块实现，`ZERO_WAM_SDPA_CHUNK_SIZE` 不生效。
-- RoPE 沿用 mentor 的复数路径及 NPU FP32 调整。
-- FSDP2、激活重算、默认 mesh 和 `AdamW(fused=True)` 沿用 mentor。
-- `wan_va/modules/model.py`、`icl_model.py`、`wan_va/distributed/`、服务端以及
-  mentor 的 `tests/test_icl_model.py` 保持基线实现。
+- 训练、推理入口使用 `torch_npu.contrib.transfer_to_npu`，由迁移层转换 CUDA 设备、同步和分布式调用；没有另一套 `runtime.py` 设备管理。
+- NPU 使用稠密 bool mask + SDPA，CUDA 使用 FlexAttention。大 mask 按行分块构建以限制临时整数矩阵，最终二维 bool mask 仍保留；MCP 同一步复用不可变 mask。
+- 全屏蔽 padding 行在 NPU 上显式清零，保持参考输出与梯度语义；RoPE 保留复数路径，在 NPU 使用 FP32。
+- FSDP2 默认 sublayer，BF16 计算、FP32 reduce；主干与 MCP 激活重算、`AdamW(fused=True)` 均启用。
+- 八卡 HumanGen 混训入口默认加载实测容量配置，CPU 上随机同步裁剪机器人视频、动作和掩码，保留完整人类示范与文字（条件 dropout 独立执行）。
+- 六源权重采样、长度分桶、索引/Arrow 缓存、manifest 复用、Wan 原始权重转换、真实动作转换及 RoboTwin 43/7 任务隔离均保留。
 
-## 保留的本地功能
+`ZERO_WAM_SDPA_CHUNK_SIZE`、`ZERO_WAM_DEVICE` 不控制当前训练路径。`MAX_TRAIN_FRAMES` 是可选额外帧数上限，不设置时八卡仍按容量配置裁剪。
 
-Wan 原始权重转换、HumanGen/RoboTwin 数据准备、43/7 任务隔离、数据读取修复、
-六源采样策略、训练命令归档、随机种子、逐步 loss/耗时记录和可选机器人片段裁剪。
-裁剪同时作用于视频、动作及掩码，保留完整人类示范，默认不开启。
+## 环境与检查
 
-旧版 NPU 专用 smoke/self-rollout 脚本未迁入此分支，避免混用独立设备管理逻辑；
-可在备份分支查看，其历史输出仍在本地 `outputs/`。mentor 的原推理服务保留。
-
-## 环境和启动
-
-复用本机 `.venv`，无需重装。新环境使用 `requirements-npu.txt`，包元数据将
-`flash-attn` 放在 CUDA extra 中；这仅调整安装依赖，不改变 mentor 的运行实现。
-LeRobot 依赖与共享 Python 说明见对应数据文档和 `shared-environment.md`。
+依赖见 `requirements-npu.txt` 与 `pyproject.toml`；目标节点使用兼容的驱动/CANN/torch_npu。已有相同挂载路径的 aarch64 环境可参考 [共享环境说明](shared-environment.md)。其他节点设置 `PYTHON_BIN`、`CANN_ENV_PATH`、模型及数据路径，不能直接依赖本机路径。
 
 ```bash
-source script/activate_shared_env.sh
-source setup_npu_env.sh
+# 已完成数据准备和模型初始化后，只展示启动命令。
 bash script/train_humangen_wan_npu.sh --dry-run
 ```
 
-实际启动仍需显式指定已分配的 `ASCEND_RT_VISIBLE_DEVICES` 并传 `--run`。
-`MAX_TRAIN_FRAMES=16` 可为混训入口开启训练片段上限，未设置时保持完整序列。
-`ZERO_WAM_DEVICE` 不再控制训练设备。
+实际启动需显式分配 `ASCEND_RT_VISIBLE_DEVICES` 并传 `--run`。默认试跑十步，八卡默认容量裁剪、混合来源分桶窗口 10、初始化 worker 1、每卡加载 worker 2。
 
-## 验证范围
-
-对齐前独立适配的 NPU 测试、离线推理及六卡训练记录，不证明本分支已通过同样验证。
-此前 165 个机器人 latent 帧样本在 MCP 调制处 OOM；mentor 的对应计算保持相同，
-并且稠密注意力 mask 的内存随 token 数平方增长，因此不能把本次对齐视为 OOM 修复。
-
-本次只进行 CPU 回归、启动命令与核心文件一致性检查，不启动 NPU 训练。
-CPU 回归需要隔离 `transfer_to_npu` 的全局 CUDA 替换，并只选择 CPU 测试参数；
-不能把这种隔离测试视为迁移层或 NPU 算子的硬件验证。
-
-可复现的 CPU 回归命令：
+CPU 回归可隔离迁移层的全局 CUDA 替换，排除硬件测试参数：
 
 ```bash
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 OMP_NUM_THREADS=2 \
@@ -62,6 +36,4 @@ raise SystemExit(pytest.main(['-q', 'tests', '-k', 'not cuda and not npu']))
 PY
 ```
 
-本次结果（2026-09-17）：94 项通过、18 项 CUDA/NPU 参数测试未运行。
-两个训练入口的 dry-run、可选裁剪参数和 shell 语法检查通过；核心模型、分布式、
-服务端、公共工具及 ICL 模型测试文件与 `mentor/main_ascend` 无差异。
+CPU 回归不代替迁移层或 NPU 算子的硬件验证。当前八卡真实子集验证结果、未完成范围和容量边界集中记录在 [训练显存说明](training-memory.md)。此前更早的独立适配/其他卡数结果仅作为历史记录。

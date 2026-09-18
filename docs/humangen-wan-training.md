@@ -1,5 +1,7 @@
 # 从 Wan 初始化的 HumanGen 外部 ICL 预训练
 
+集群部署请先阅读 [八卡训练交接](cluster-training.md)。
+
 本机公共目录已包含五个外部来源解压后的机器人数据、动作、机器人 latent、人类视频 latent、配对 manifest，以及各机器人对应的动作转换配置。本流程只读取 `/mnt/sfs_turbo/public/datasets/HumanGen` 中的原始文件，在 `data/HumanGen` 下创建本地数据视图和缓存目录。
 
 | 来源 | LeRobot 数据目录数（非语义任务数） | manifest 配对数 | 机器人训练片段数 |
@@ -34,7 +36,7 @@ HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 OMP_NUM_THREADS=2 \
 .venv/bin/python script/check_humangen_training.py --all-repos
 ```
 
-首次真正启动训练时，rank 0 会先建立缺失的 Arrow 和数据索引缓存，完成后其他 rank 再继续。`INIT_WORKERS` 默认为 4。每个进程会缓存 manifest 索引，避免上千个数据目录反复解析同一份大型 JSON；文件大小或修改时间变化时，缓存失效并重新加载。
+首次真正启动训练时，rank 0 会先建立缺失的 Arrow 和数据索引缓存，完成后其他 rank 再继续。`INIT_WORKERS` 默认为 1，串行初始化各任务，避免多进程返回任务对象时重复复制大型 manifest。每个进程会缓存 manifest 索引，避免上千个数据目录反复解析同一份大型 JSON；文件大小或修改时间变化时，缓存失效并重新加载。
 
 ## 默认采样策略与启动
 
@@ -73,15 +75,15 @@ CPU 启动前检查会打印策略，并依次检查外部 HumanGen 与 RoboTwin
 bash script/train_humangen_wan_npu.sh --check-only
 ```
 
-在已分配六张空闲卡的主机上，执行 10 步训练验证。以下设备编号只是示例，需替换为实际分配的物理卡：
+在已分配八张空闲卡的主机上，执行 10 步训练验证。以下设备编号只是示例，需替换为实际分配的物理卡：
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5 \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 ZERO_WAM_SAVE_ROOT="$PWD/train_out/wan-humangen-robotwin-4to1-sqrt-seed42-pilot" \
 bash script/train_humangen_wan_npu.sh --run
 ```
 
-未指定设备列表时，dry-run 默认展示六个进程；实际启动时进程数由 `ASCEND_RT_VISIBLE_DEVICES` 决定。六卡来自之前的 FSDP 经验，不表示已重新验证当前完整配置的显存或吞吐。只有 `--run` 启动训练，数据准备、CPU 检查和 dry-run 均不进行 NPU 训练、显存测试或仿真器评测。
+未指定设备列表时，dry-run 默认展示八个进程；实际启动时进程数由 `ASCEND_RT_VISIBLE_DEVICES` 决定。八卡自动启用容量裁剪，混合来源默认启用长度分桶 10，单来源默认关闭分桶。只有 `--run` 启动训练，数据准备、CPU 检查和 dry-run 均不进行 NPU 训练、显存测试或仿真器评测。
 
 默认 10 步只用于流程验证。正式实验可通过 `NUM_STEPS`、`SAVE_INTERVAL` 和新的 `ZERO_WAM_SAVE_ROOT` 设置时长及保存位置；学习率、随机种子等参数与 RoboTwin 启动入口一致。每次实际运行额外保存 `sampling.json`，记录任务数先验、配置内容、最终六源权重及分组概率。
 
@@ -116,4 +118,4 @@ IFP 权重、RoPE 偏移和单轨迹训练方式继续沿用公开代码，详�
 
 该读取方式有专门的回归测试，覆盖变长/定长数值列表及 Arrow 缓存回读。数据准备、混合采样、manifest 缓存、动作转换和 parquet 兼容相关的 43 项测试通过。五源与六源启动命令均通过 dry-run 和 shell 语法检查；未启动 NPU 训练。
 
-默认联合采样策略落地后，另运行采样策略、混合采样与公开 ICL 配置相关测试，28 项通过。其中验证了六个 rank 的交错采样序列与单进程全局序列一致，以及 120,000 次抽样的来源频率符合配置概率。统一 `--check-only` 入口通过，共实际读取 65 个样本：外部 HumanGen 22 个，RoboTwin 43 个。完整六卡训练的显存、吞吐、反向传播和保存流程仍需在分配到空闲卡后通过默认 10 步训练验证。
+默认联合采样策略落地后，另运行采样策略、混合采样与公开 ICL 配置相关测试，28 项通过。其中验证了六个 rank 的交错采样序列与单进程全局序列一致，以及 120,000 次抽样的来源频率符合配置概率。统一 `--check-only` 入口通过，共实际读取 65 个样本：外部 HumanGen 22 个，RoboTwin 43 个。这是当时的数据侧验证记录。后续八卡容量裁剪和混合子集已完成前向、反向及优化器更新测试，范围见 [最新显存验证记录](training-memory.md#2026-09-18接入裁剪后的八卡验收)；它不覆盖六卡、全量长训或八卡 checkpoint 保存。

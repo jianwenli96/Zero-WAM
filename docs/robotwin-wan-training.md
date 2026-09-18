@@ -68,7 +68,7 @@ bash script/train_robotwin_wan_npu.sh --run
 
 示例不表示物理卡 0–7 当前可用。`--run` 要求显式指定可见设备，根据列表推导进程数，并拒绝复用已有运行目录。
 
-当前配置尚未实测完整模型训练的显存与吞吐。约 108 亿个独立参数的 FP32 权重、梯度和两个 Adam 动量合计约 173 GB（十进制），还不包括 BF16 参数聚合及激活，因此两张 64 GB 卡不足以承载当前配置。此脚本未启用优化器 CPU 卸载，应先安排足够资源再试跑。
+当前纯 RoboTwin 入口未随最近六源子集测试重新验收；最近的完整模型八卡混合子集测试见 [显存记录](training-memory.md)，不应当作纯 RoboTwin 全量训练结论。约 108 亿个独立参数的 FP32 权重、梯度和两个 Adam 动量合计约 173 GB（十进制），还不包括 BF16 参数聚合及激活，因此两张 64 GB 卡不足以承载当前配置。此脚本未启用优化器 CPU 卸载，应先安排足够资源再试跑。
 
 支持通过环境变量覆盖以下参数：`MODEL_PATH`、`HUMANGEN_ROOT`、`ZERO_WAM_SAVE_ROOT`、`TRAIN_SEED`、`NUM_STEPS`、`SAVE_INTERVAL`、`GRAD_ACCUM`、`LOAD_WORKERS`、`LEARNING_RATE`、`MASTER_PORT` 和 `PYTHON_BIN`。
 

@@ -298,6 +298,8 @@ Each task uses the fixed human demonstration in `evaluation/robotwin/robotwin_ic
 
 ## Training
 
+**Ascend 单机八卡交接入口：[lianjie-dev 集群训练说明](docs/cluster-training.md)**，包含训练设计、容量约束、数据准备和启动命令。
+
 从原始 Wan 基座开始训练，请先阅读 [Wan 权重初始化说明](docs/wan-initialization.md)。本地 RoboTwin 数据检查与昇腾启动入口见 [RoboTwin 训练说明](docs/robotwin-wan-training.md)；使用五个外部 HumanGen 来源或六源混训，见 [HumanGen 预训练说明](docs/humangen-wan-training.md)。
 
 下方两种官方训练模式默认从发布的 `zero-wam-pretrain` 权重开始。也可按上方说明，通过 `MODEL_PATH` 指定从 Wan 转换得到的初始化权重。模型和输出路径配置如下：
