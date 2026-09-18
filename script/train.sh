@@ -3,9 +3,9 @@
 set -x
 
 umask 007
- 
+
 NGPU=${NGPU:-"8"}
-PYTHON_BIN=${PYTHON_BIN:-"python"}
+PYTHON_BIN=${PYTHON_BIN:-"/mnt/sfs_turbo/public/apps/miniforge3/envs/lingbot-vggt/bin/python"}
 MASTER_PORT=${MASTER_PORT:-"29501"}
 PORT=${PORT:-"1106"}
 LOG_RANK=${LOG_RANK:-"0"}
@@ -31,10 +31,14 @@ torchft_lighthouse=${TORCHFT_LIGHTHOUSE}
 config_name=${CONFIG_NAME}
 datasets=${DATASETS}
 
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+export HF_HOME="${HF_HOME:-/mnt/sfs_turbo/public/caches/huggingface}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+
 ## cmd setting
 export TOKENIZERS_PARALLELISM=false
 PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" TORCHFT_LIGHTHOUSE=${torchft_lighthouse} \
-"${PYTHON_BIN}" -m torch.distributed.run \
+exec "${PYTHON_BIN}" -m torch.distributed.run \
     --nproc_per_node=${num_gpu} \
     --local-ranks-filter=${log_rank} \
     --master_port ${master_port} \

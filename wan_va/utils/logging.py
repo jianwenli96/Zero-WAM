@@ -6,8 +6,23 @@
 
 import logging
 import os
+from pathlib import Path
 
 logger = logging.getLogger()
+
+
+def add_file_logger(save_root, rank):
+    """Keep each distributed worker's logs in its own file."""
+    log_dir = Path(save_root)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    filename = 'train.log' if rank == 0 else f'train_rank_{rank}.log'
+    handler = logging.FileHandler(log_dir / filename, encoding='utf-8')
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter(
+        f'%(asctime)s - rank {rank} - %(name)s - %(levelname)s - %(message)s'
+    ))
+    logger.addHandler(handler)
+    return handler
 
 
 def init_logger():

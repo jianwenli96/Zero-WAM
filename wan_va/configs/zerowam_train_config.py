@@ -5,6 +5,8 @@ from easydict import EasyDict
 zerowam_train_cfg = EasyDict()
 
 # Zero-WAM always trains the video, action, ICL, and MCP branches together.
+zerowam_train_cfg.enable_wandb = True
+zerowam_train_cfg.wandb_mode = 'offline'
 zerowam_train_cfg.enable_mcp = True
 zerowam_train_cfg.num_mcp_modules = 4
 zerowam_train_cfg.mcp_blocks_per_group = 1

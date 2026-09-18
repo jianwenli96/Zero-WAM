@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
 from copy import deepcopy
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import wandb
@@ -59,6 +60,7 @@ from .dataset import (
     parse_dataset_mixture,
 )
 from .mcp import shift_latents_for_mcp, validate_mcp_settings
+from .utils.logging import add_file_logger
 import gc
 
 
@@ -164,6 +166,38 @@ def _save_sharded_safetensors(state_dict, output_dir, max_shard_size="3GB"):
             json.dump(index, handle, indent=2)
 
 
+def _prepare_run_directory(config):
+    """Use rank 0's UTC timestamp and output root on every worker."""
+    run_paths = [None]
+    if config.rank == 0:
+        run_name = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
+        run_paths[0] = str(Path(config.save_root).expanduser().resolve() / run_name)
+    dist.broadcast_object_list(run_paths, src=0)
+    config.save_root = run_paths[0]
+    config.run_name = Path(config.save_root).name
+    Path(config.save_root).mkdir(parents=True, exist_ok=True)
+
+
+def _init_wandb(config):
+    if not config.enable_wandb or config.rank != 0:
+        return None
+    mode = os.getenv('WANDB_MODE', getattr(config, 'wandb_mode', 'offline'))
+    if mode == 'online':
+        wandb.login(
+            host=os.getenv('WANDB_BASE_URL'), key=os.getenv('WANDB_API_KEY')
+        )
+    run = wandb.init(
+        entity=os.getenv('WANDB_TEAM_NAME'),
+        project=os.getenv('WANDB_PROJECT', 'va_robotwin'),
+        dir=config.save_root,
+        config=config,
+        mode=mode,
+        name=config.run_name,
+    )
+    logger.info(f'WandB logging enabled: {mode}')
+    return run
+
+
 class Trainer:
     @staticmethod
     def _resolve_transformer_path(path):
@@ -175,19 +209,7 @@ class Trainer:
         return str(transformer_path)
 
     def __init__(self, config):
-        if config.enable_wandb and config.rank == 0:
-            wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
-            self.wandb = wandb
-            self.wandb.init(
-                entity=os.environ["WANDB_TEAM_NAME"],
-                project=os.getenv("WANDB_PROJECT", "va_robotwin"),
-                # dir=log_dir,
-                config=config,
-                mode="online",
-                name='test_lln'
-                # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
-            )
-            logger.info("WandB logging enabled")
+        self.wandb = _init_wandb(config)
         self.step = 0
         self.config = config
         self.device = torch.device(f"cuda:{config.local_rank}")
@@ -904,6 +926,7 @@ class Trainer:
                     if self.enable_mcp:
                         postfix['mcp_loss'] = f'{mcp_total_loss_show:.4f}'
                     progress_bar.set_postfix(postfix)
+                    logger.info('Training metrics: %s', postfix)
                     if self.config.enable_wandb:
                         log_values = {
                             'loss_metrics/global_avg_video_loss': latent_loss_show,
@@ -980,17 +1003,30 @@ def run(args):
 
     init_distributed(world_size, local_rank, rank)
 
-    if rank == 0:
-        logger.info(f"Using config: {args.config_name}")
-        logger.info(f"Using DATASETS: {args.datasets}")
-        logger.info(f"World size: {world_size}, Local rank: {local_rank}")
-
+    file_handler = None
     try:
+        _prepare_run_directory(config)
+        file_handler = add_file_logger(config.save_root, rank)
+        logger.info(f"World size: {world_size}, Local rank: {local_rank}")
+        if rank == 0:
+            logger.info(f"Using config: {args.config_name}")
+            logger.info(f"Using DATASETS: {args.datasets}")
+            logger.info(f'Training output directory: {config.save_root}')
         trainer = Trainer(config)
         trainer.train()
+    except Exception:
+        logger.exception('Training failed')
+        raise
     finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            if rank == 0 and config.enable_wandb and wandb.run is not None:
+                wandb.finish()
+        finally:
+            if file_handler is not None:
+                logger.removeHandler(file_handler)
+                file_handler.close()
 
 
 def main():
@@ -1015,7 +1051,7 @@ def main():
         "--save-root",
         type=str,
         default=None,
-        help="Root directory for saving checkpoints",
+        help="Output root; each run creates a UTC timestamp subdirectory",
     )
     parser.add_argument(
         "--model-path",
