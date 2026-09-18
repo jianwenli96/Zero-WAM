@@ -70,6 +70,7 @@ original_step = train.Trainer._train_step
 def step(self, batch, batch_idx):
     torch.npu.synchronize()
     torch.npu.reset_peak_memory_stats()
+    allocator_before = torch.npu.memory_stats()
     started = time.perf_counter()
     emit('start', step=self.step + 1,
          robot_shape=list(batch['latents'].shape),
@@ -80,8 +81,13 @@ def step(self, batch, batch_idx):
     try:
         result = original_step(self, batch, batch_idx)
         torch.npu.synchronize()
+        allocator_after = torch.npu.memory_stats()
         emit('success', step=self.step + 1, seconds=time.perf_counter() - started,
              memory_gib=memory(),
+             allocator_retries=allocator_after.get('num_alloc_retries', 0)
+             - allocator_before.get('num_alloc_retries', 0),
+             allocator_ooms=allocator_after.get('num_ooms', 0)
+             - allocator_before.get('num_ooms', 0),
              losses={k: float(result[k].item()) for k in ('latent_loss', 'action_loss', 'mcp_loss')},
              optimizer_step_skipped=result.get('optimizer_step_skipped'))
         return result
@@ -93,6 +99,6 @@ def step(self, batch, batch_idx):
 
 train.Trainer._train_step = step
 if __name__ == '__main__':
-    emit('launch')
+    emit('launch', allocator_config=os.environ.get('PYTORCH_NPU_ALLOC_CONF'))
     train.init_logger()
     train.main()

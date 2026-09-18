@@ -3,6 +3,9 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
+# Long mixed sequences repeatedly reclaim expanded physical segments on 910B3.
+# Use the ordinary caching allocator; preserve explicit user overrides.
+export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:False}
 PYTHON_BIN=${PYTHON_BIN:-"$ROOT/.venv/bin/python"}
 export MODEL_PATH=${MODEL_PATH:-"$ROOT/checkpoints/zero-wam-wan-init-fp32-seed42"}
 HUMANGEN_ROOT=${HUMANGEN_ROOT:-"$ROOT/data/HumanGen"}
@@ -88,6 +91,7 @@ fi
 if [[ "$MODE" == --dry-run ]]; then
   "$PYTHON_BIN" script/resolve_training_sampling.py "${SAMPLING_ARGS[@]}" --output-format json
   printf 'Device allocation: %s\n' "${ASCEND_RT_VISIBLE_DEVICES:-not assigned; required for --run}"
+  printf 'NPU allocator: %s\n' "$PYTORCH_NPU_ALLOC_CONF"
   printf '%q ' "${COMMAND[@]}"
   printf '\n'
   exit
@@ -107,6 +111,7 @@ set +u
 source "$ROOT/setup_npu_env.sh"
 set -u
 mkdir -p "$ZERO_WAM_SAVE_ROOT"
+printf '%s\n' "$PYTORCH_NPU_ALLOC_CONF" > "$ZERO_WAM_SAVE_ROOT/npu-allocator.txt"
 "$PYTHON_BIN" script/resolve_training_sampling.py "${SAMPLING_ARGS[@]}" --output-format json > "$ZERO_WAM_SAVE_ROOT/sampling.json"
 printf '%q ' "${COMMAND[@]}" > "$ZERO_WAM_SAVE_ROOT/command.txt"
 printf '\n' >> "$ZERO_WAM_SAVE_ROOT/command.txt"

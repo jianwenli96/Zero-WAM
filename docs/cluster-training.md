@@ -15,6 +15,7 @@
 | 优化器 | fused AdamW，LR 1e-4，betas 0.9/0.95，weight decay 0.01，预热 200 步后恒定 LR |
 | 梯度 | max norm 1；范数非有限或超过阈值 20 时跳过优化器更新并记录 |
 | 并行与精度 | FSDP2 sublayer，BF16 计算、FP32 reduce，主干及 MCP 块激活检查点，forward 后 reshard |
+| NPU 分配器 | 混训入口默认 `PYTORCH_NPU_ALLOC_CONF=expandable_segments:False`，保留显式环境覆盖；实际值写入 `npu-allocator.txt` |
 | 批次 | 每卡一条轨迹、梯度累积 1；一次优化器步共八条轨迹，token 数可不同 |
 | 数据加载 | `INIT_WORKERS=1`、每卡 `LOAD_WORKERS=2`；冷缓存时 rank 0 先构建索引，其他 rank 随后读取 |
 | 长度分桶 | 混合来源默认 `LENGTH_BUCKET_STEPS=10`；在同一批加权抽样结果内重排，按裁剪后的 2R+H 估计成本 |
@@ -23,6 +24,8 @@
 裁剪在 CPU 上同步作用于机器人 latent、动作与动作掩码；不因过长删除样本。窗口裁剪不缩短人类视频与文字；上述条件 dropout 仍按训练配置独立执行。人类视频与机器人轨迹没有逐帧对齐关系。
 
 当前 NPU 内存优化还包括：按行分块生成稠密注意力 mask，减少整数临时矩阵；同一步 MCP 各深度复用不可变 mask；NPU 全屏蔽 padding 行输出清零，保持参考输出/梯度语义。分块构建后仍保存完整二维 bool mask，不是稀疏注意力。数据侧保留索引/Arrow 缓存与 manifest 索引复用。单进程数据初始化避免任务对象经多进程返回时复制大型 manifest；训练本身仍为八进程。
+
+时间步 MLP 按 latent 帧计算，AdaLN 投影保持按帧的紧凑表示，在使用某组 shift/scale/gate 时才展开到空间 token，减少重复计算和大张量分配。权重结构、损失定义及裁剪预算不变；BF16 运算顺序改变可能产生舍入差异。长序列吞吐与分配器诊断见 [内存优化与验证范围](training-memory.md#内存优化与验证范围)。
 
 权重映射见 [Wan 初始化说明](wan-initialization.md)。此配方没有补充未公开的 VA-only/内部 HumanGen 数据，没有实现论文的 160K token 多样本打包；RoPE 偏移与 IFP 最后一项损失权重继续沿用公开代码，不能标为完整论文配方复现。
 
@@ -43,6 +46,7 @@ Git 分支包含代码、配置、空文本特征和说明。初始化权重、H
 ```bash
 export PYTHON_BIN=/cluster/envs/zero-wam/bin/python
 export CANN_ENV_PATH=/usr/local/Ascend/cann-9.1.0/set_env.sh
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:False
 export HUMANGEN_SOURCE=/cluster/datasets/HumanGen
 export HUMANGEN_ROOT=/cluster/work/lianjie/HumanGen-view
 export MODEL_PATH=/cluster/checkpoints/zero-wam-wan-init-fp32-seed42
@@ -93,7 +97,7 @@ bash script/train_humangen_wan_npu.sh --dry-run
 bash script/train_humangen_wan_npu.sh --run
 ```
 
-`--dry-run` 只显示配置，默认按八进程展示；真正运行仍要求显式设备分配。`--run` 自动加载 CANN 环境，默认启用 `expandable_segments:True`，并拒绝复用已有输出目录。首个优化器步包含较大的首次执行开销，不能直接当作稳定吞吐。
+`--dry-run` 只显示配置，默认按八进程展示；真正运行仍要求显式设备分配。`--run` 自动加载 CANN 环境，分配器默认使用 `expandable_segments:False`（已有环境设置优先），并拒绝复用已有输出目录。首个优化器步包含较大的首次执行开销，不能直接当作稳定吞吐。
 
 正式训练使用新的目录，并明确总步数/保存间隔。下面 50,000 步沿用训练配置中的总步数，仅作为启动示例；实际运行预算由集群实验安排决定：
 
@@ -126,8 +130,8 @@ CPU 回归不代替目标设备验证。
 
 ## 运行产物与限制
 
-最近的八卡真实子集训练已验证裁剪、前向、反向及优化器更新；容量子集和吞吐子集均在用户要求下提前停止，完成范围见 [容量规则与验证范围](training-memory.md)。已有结果不覆盖全量数据、长期收敛、多机或本次八卡配置的 checkpoint 保存阶段，因此目标节点的流程检查保留保存步骤。
+最近的八卡真实子集训练已完成 40 条容量案例各两步，以及 64 步混合吞吐稳定性验证，无记录 OOM 或优化器跳步；完成范围与同样本性能对照见 [容量规则与验证范围](training-memory.md)。已有结果不覆盖全量数据、长期收敛、多机或本次八卡配置的 checkpoint 保存阶段，因此目标节点的流程检查保留保存步骤。
 
-每个运行目录包含 `command.txt`、`sampling.json`、数据/初始化来源、`code-head.txt`、`code-changes.patch`、`source.tar.gz`、`train.log` 和 `metrics.jsonl`。模型权重保存在 `checkpoints/checkpoint_step_N/transformer`。保存间隔需要整除总步数才能在最后一步保存。
+每个运行目录包含 `command.txt`、`sampling.json`、`npu-allocator.txt`、数据/初始化来源、`code-head.txt`、`code-changes.patch`、`source.tar.gz`、`train.log` 和 `metrics.jsonl`。模型权重保存在 `checkpoints/checkpoint_step_N/transformer`。保存间隔需要整除总步数才能在最后一步保存。
 
 当前 checkpoint 是 BF16 模型快照，**没有完整优化器、scheduler、采样器和随机数状态，不支持精确断点续训**。不要把从权重重新启动描述为完整恢复。
