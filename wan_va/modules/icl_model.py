@@ -334,6 +334,24 @@ class ICLAttentionBackend:
         ).transpose(1, 2)
 
 
+class _NpuRMSNorm(nn.RMSNorm):
+    """Keep RMSNorm parameters while avoiding decomposed NPU intermediates."""
+
+    def forward(self, hidden_states):
+        if (
+            hidden_states.device.type != "npu"
+            or hidden_states.dtype not in (torch.float32, torch.bfloat16)
+            or self.weight is None
+            or self.weight.dtype != hidden_states.dtype
+            or len(self.normalized_shape) != 1
+        ):
+            return super().forward(hidden_states)
+        import torch_npu
+
+        eps = self.eps if self.eps is not None else torch.finfo(hidden_states.dtype).eps
+        return torch_npu.npu_rms_norm(hidden_states, self.weight, epsilon=eps)[0]
+
+
 class WanICLAttention(nn.Module):
     def __init__(
         self,
@@ -363,8 +381,8 @@ class WanICLAttention(nn.Module):
         self.to_out = nn.ModuleList(
             [nn.Linear(self.inner_dim, dim, bias=True), nn.Dropout(dropout)]
         )
-        self.norm_q = nn.RMSNorm(self.inner_dim, eps=eps, elementwise_affine=True)
-        self.norm_k = nn.RMSNorm(self.inner_dim, eps=eps, elementwise_affine=True)
+        self.norm_q = _NpuRMSNorm(self.inner_dim, eps=eps, elementwise_affine=True)
+        self.norm_k = _NpuRMSNorm(self.inner_dim, eps=eps, elementwise_affine=True)
 
         if not attn_moe:
             raise ValueError("The released ICL checkpoints require attn_moe=True")

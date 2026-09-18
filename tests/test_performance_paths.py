@@ -11,6 +11,54 @@ from wan_va.modules import icl_model
 from wan_va.modules.icl_model import ICLAttentionBackend as Backend
 
 
+@pytest.mark.parametrize('affine', [False, True])
+def test_rms_norm_cpu_fallback_preserves_state_and_gradients(affine):
+    torch.manual_seed(431)
+    norm = icl_model._NpuRMSNorm(16, eps=1e-6, elementwise_affine=affine)
+    reference = torch.nn.RMSNorm(16, eps=1e-6, elementwise_affine=affine)
+    reference.load_state_dict(norm.state_dict(), strict=True)
+    x = torch.randn(2, 7, 16, requires_grad=True)
+    ref_x = x.detach().clone().requires_grad_()
+    a, b = norm(x), reference(ref_x)
+    upstream = torch.randn_like(a)
+    a.backward(upstream)
+    b.backward(upstream)
+    torch.testing.assert_close(a, b, rtol=0, atol=0)
+    torch.testing.assert_close(x.grad, ref_x.grad, rtol=0, atol=0)
+    if affine:
+        torch.testing.assert_close(norm.weight.grad, reference.weight.grad,
+                                   rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize('shape', [(2, 127, 3072), (2, 17, 36)])
+@pytest.mark.parametrize('scale', [1.0, 0.001])
+def test_npu_fused_rms_outputs_and_gradients(dtype, shape, scale):
+    pytest.importorskip('torch_npu')
+    if not torch.npu.is_available():
+        pytest.skip('NPU unavailable')
+    torch.manual_seed(431)
+    norm = icl_model._NpuRMSNorm(shape[-1], eps=1e-6, device='npu', dtype=dtype)
+    with torch.no_grad():
+        norm.weight.uniform_(0.5, 1.5)
+    reference = torch.nn.RMSNorm(shape[-1], eps=1e-6, device='npu', dtype=dtype)
+    reference.load_state_dict(norm.state_dict(), strict=True)
+    x = (torch.randn(shape, device='npu', dtype=dtype) * scale).requires_grad_()
+    ref_x = x.detach().clone().requires_grad_()
+    a, b = norm(x), reference(ref_x)
+    upstream = torch.randn_like(a)
+    a.backward(upstream)
+    b.backward(upstream)
+    # Include small inputs where epsilon matters and token-varying gradients.
+    # Relative L2 avoids unstable per-element ratios at cancellation zeros.
+    for actual, expected in ((a, b), (x.grad, ref_x.grad),
+                             (norm.weight.grad, reference.weight.grad)):
+        assert torch.isfinite(actual).all()
+        relative_error = ((actual.float() - expected.float()).norm()
+                          / expected.float().norm().clamp_min(1e-12))
+        assert relative_error < (1e-3 if dtype == torch.bfloat16 else 1e-5)
+
+
 def test_compact_modulation_matches_dense_with_different_spatial_sizes():
     from wan_va.modules.icl_model import (
         FrameTimestepProjection, WanICLTransformerBlock,
