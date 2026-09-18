@@ -65,7 +65,7 @@ def test_launcher_uses_resolved_policy_without_loading_npu(tmp_path):
     env = dict(os.environ, MODEL_PATH=str(model), HUMANGEN_ROOT=str(data), PYTHON_BIN=sys.executable)
     for key in ('DATASETS', 'SAMPLING_CONFIG', 'ASCEND_RT_VISIBLE_DEVICES', 'NPROC_PER_NODE',
                 'INIT_WORKERS', 'LENGTH_BUCKET_STEPS', 'SEQUENCE_CAPACITY_PROFILE',
-                'FSDP_GRANULARITY', 'PYTORCH_NPU_ALLOC_CONF'):
+                'FSDP_GRANULARITY', 'PYTORCH_NPU_ALLOC_CONF', 'FSDP_ASYNC_UNSHARD'):
         env.pop(key, None)
     result = subprocess.run(['bash', str(root / 'script/train_humangen_wan_npu.sh'), '--dry-run'],
                             env=env, capture_output=True, text=True, check=True)
@@ -76,14 +76,17 @@ def test_launcher_uses_resolved_policy_without_loading_npu(tmp_path):
     assert '--length-bucket-steps 10' in result.stdout
     assert '--sequence-capacity-profile' in result.stdout
     assert '--fsdp-granularity sublayer' in result.stdout
+    assert '--fsdp-async-unshard' in result.stdout
     assert '--human-gen-root' in result.stdout
     assert 'NPU allocator: expandable_segments:False' in result.stdout
     assert not (tmp_path / 'data/validation.json').exists()
     env['PYTORCH_NPU_ALLOC_CONF'] = 'expandable_segments:True'
+    env['FSDP_ASYNC_UNSHARD'] = '0'
     overridden = subprocess.run(
         ['bash', str(root / 'script/train_humangen_wan_npu.sh'), '--dry-run'],
         env=env, capture_output=True, text=True, check=True)
     assert 'NPU allocator: expandable_segments:True' in overridden.stdout
+    assert '--no-fsdp-async-unshard' in overridden.stdout
 
 
 @pytest.mark.parametrize('cards,override,enabled', [(8, None, True), (8, 'off', False), (7, None, False)])

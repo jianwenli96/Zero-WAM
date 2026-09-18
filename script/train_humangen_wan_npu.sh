@@ -73,6 +73,11 @@ COMMAND=("$PYTHON_BIN" -m torch.distributed.run --nproc_per_node "$NPROC_PER_NOD
   --fsdp-granularity "${FSDP_GRANULARITY:-sublayer}"
   --learning-rate "${LEARNING_RATE:-0.0001}" --drop-icl 0.1 --droptext-target 0.4
   --disable-wandb)
+case "${FSDP_ASYNC_UNSHARD:-1}" in
+  1) COMMAND+=(--fsdp-async-unshard) ;;
+  0) COMMAND+=(--no-fsdp-async-unshard) ;;
+  *) echo 'FSDP_ASYNC_UNSHARD must be 0 or 1' >&2; exit 1 ;;
+esac
 # The empirical profile is calibrated only for the eight-card configuration.
 # Explicit 'off' preserves uncropped training (or a manual MAX_TRAIN_FRAMES cap).
 CAPACITY_PROFILE=${SEQUENCE_CAPACITY_PROFILE:-}

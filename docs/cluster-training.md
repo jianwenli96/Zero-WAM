@@ -15,6 +15,7 @@
 | 优化器 | fused AdamW，LR 1e-4，betas 0.9/0.95，weight decay 0.01，预热 200 步后恒定 LR |
 | 梯度 | max norm 1；范数非有限或超过阈值 20 时跳过优化器更新并记录 |
 | 并行与精度 | FSDP2 sublayer，BF16 计算、FP32 reduce，主干及 MCP 块激活检查点，forward 后 reshard |
+| FSDP 缓冲区 | 混训入口默认 `FSDP_ASYNC_UNSHARD=1`，使用当前流分配 all-gather 缓冲区；保留反向预取，设 0 恢复原路径 |
 | NPU 分配器 | 混训入口默认 `PYTORCH_NPU_ALLOC_CONF=expandable_segments:False`，保留显式环境覆盖；实际值写入 `npu-allocator.txt` |
 | 批次 | 每卡一条轨迹、梯度累积 1；一次优化器步共八条轨迹，token 数可不同 |
 | 数据加载 | `INIT_WORKERS=1`、每卡 `LOAD_WORKERS=2`；冷缓存时 rank 0 先构建索引，其他 rank 随后读取 |
@@ -26,6 +27,8 @@
 当前 NPU 内存优化还包括：按行分块生成稠密注意力 mask，减少整数临时矩阵；同一步 MCP 各深度复用不可变 mask；NPU 全屏蔽 padding 行输出清零，保持参考输出/梯度语义。分块构建后仍保存完整二维 bool mask，不是稀疏注意力。数据侧保留索引/Arrow 缓存与 manifest 索引复用。单进程数据初始化避免任务对象经多进程返回时复制大型 manifest；训练本身仍为八进程。
 
 时间步 MLP 按 latent 帧计算，AdaLN 投影保持按帧的紧凑表示，在使用某组 shift/scale/gate 时才展开到空间 token，减少重复计算和大张量分配。权重结构、损失定义及裁剪预算不变；BF16 运算顺序改变可能产生舍入差异。长序列吞吐与分配器诊断见 [内存优化与验证范围](training-memory.md#内存优化与验证范围)。
+
+NPU 上的 Q/K RMSNorm 使用融合算子，减少分解归一化的临时张量；参数及 checkpoint 键保持一致，CPU/CUDA 沿用原路径。FSDP 异步 unshard 依赖当前 PyTorch 2.9 的 FSDP2 内部接口，缺失时明确报错，可设置 `FSDP_ASYNC_UNSHARD=0` 关闭。直接调用 `wan_va.train` 时需显式传入 `--fsdp-async-unshard` 才启用。
 
 权重映射见 [Wan 初始化说明](wan-initialization.md)。此配方没有补充未公开的 VA-only/内部 HumanGen 数据，没有实现论文的 160K token 多样本打包；RoPE 偏移与 IFP 最后一项损失权重继续沿用公开代码，不能标为完整论文配方复现。
 
@@ -86,6 +89,7 @@ bash script/train_humangen_wan_npu.sh --check-only
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export INIT_WORKERS=1 LOAD_WORKERS=2 LENGTH_BUCKET_STEPS=10
 export FSDP_GRANULARITY=sublayer GRAD_ACCUM=1
+export FSDP_ASYNC_UNSHARD=1
 export SEQUENCE_CAPACITY_PROFILE="$PWD/wan_va/configs/sequence_capacity_8npu.json"
 export TRAIN_SEED=42 LEARNING_RATE=0.0001
 export MASTER_PORT=29617

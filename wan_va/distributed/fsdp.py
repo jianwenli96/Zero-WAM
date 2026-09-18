@@ -24,7 +24,8 @@ def apply_ac(model):
 def shard_model(model,
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.float32,
-                granularity="sublayer"):
+                granularity="sublayer",
+                async_unshard=False):
     if granularity not in ("sublayer", "block"):
         raise ValueError('FSDP granularity must be sublayer or block')
     mp_policy = MixedPrecisionPolicy(
@@ -51,6 +52,16 @@ def shard_model(model,
                 fully_shard(block, **fsdp_config)
 
     fully_shard(model, **fsdp_config)
+    if async_unshard:
+        # PyTorch 2.9 allocates async all-gather staging buffers on the current
+        # stream and releases them after copy-out. This trades implicit forward
+        # overlap for better buffer reuse; backward prefetch remains enabled.
+        configure = getattr(model, '_set_unshard_async_op', None)
+        if configure is None:
+            raise RuntimeError(
+                'FSDP async unshard requires the PyTorch 2.9 FSDP2 API; '
+                'disable --fsdp-async-unshard on unsupported versions')
+        configure(True)
     return model
 
 

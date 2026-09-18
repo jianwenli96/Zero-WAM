@@ -273,8 +273,13 @@ class Trainer:
         apply_ac(self.transformer)
 
         logger.info("Setting up FSDP...")
-        shard_fn = partial(shard_model, granularity=getattr(
-            config, 'fsdp_granularity', 'sublayer'))
+        async_unshard = getattr(config, 'fsdp_async_unshard', False)
+        logger.info("FSDP async unshard: %s", async_unshard)
+        shard_fn = partial(
+            shard_model,
+            granularity=getattr(config, 'fsdp_granularity', 'sublayer'),
+            async_unshard=async_unshard,
+        )
         self.transformer = _configure_model(
             model=self.transformer,
             shard_fn=shard_fn,
@@ -1055,6 +1060,7 @@ def run(args):
         'sequence_capacity_profile': getattr(args, 'sequence_capacity_profile', None),
         'length_bucket_steps': getattr(args, 'length_bucket_steps', 0),
         'fsdp_granularity': getattr(args, 'fsdp_granularity', 'sublayer'),
+        'fsdp_async_unshard': getattr(args, 'fsdp_async_unshard', False),
     }
     for key, value in overrides.items():
         if value is not None:
@@ -1169,6 +1175,8 @@ def main():
                         help='Group similar-cost samples within this many distributed microbatches (0 disables; mixtures only)')
     parser.add_argument('--fsdp-granularity', choices=['sublayer', 'block'],
                         default='sublayer', help='FSDP2 grouping: block reduces collective count')
+    parser.add_argument('--fsdp-async-unshard', action=argparse.BooleanOptionalAction,
+                        default=False, help='Use current-stream FSDP2 all-gather allocations (PyTorch 2.9 API)')
 
     args = parser.parse_args()
     run(args)
