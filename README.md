@@ -37,20 +37,13 @@
   </a>
 </p>
 
-## 昇腾开发文档
+## 昇腾训练
 
-- [基于 mentor 的昇腾适配与验证](docs/ascend.md)
-- [跨主机复用共享 Python 环境](docs/shared-environment.md)
-- [原始 Wan 权重转换与初始化](docs/wan-initialization.md)
-- [HumanGen 数据准备与预训练](docs/humangen-wan-training.md)
-- [训练显存、长序列裁剪与性能](docs/training-memory.md)
-- [RoboTwin 数据准备与训练](docs/robotwin-wan-training.md)
+- [单机八卡训练：设计、数据准备和启动](docs/cluster-training.md)
+- [Wan 权重转换与初始化](docs/wan-initialization.md)
+- [显存容量与随机窗口裁剪](docs/training-memory.md)
 
-当前 NPU 核心实现以 `jianwenli96/Zero-WAM` 的 `main_ascend`（`d9a2177`）为基线，采用 `transfer_to_npu` 和稠密 SDPA。原独立适配保存在 `backup/pre-mentor-alignment`。
-
-昇腾联合训练入口 `script/train_humangen_wan_npu.sh` 默认采用 HumanGen:RoboTwin=4:1，HumanGen 内部按论文任务数平方根加权，来源内均匀抽样。执行 `--dry-run` 查看完整命令与实际概率，`--check-only` 运行 CPU 数据检查。可用 `MAX_TRAIN_FRAMES` 显式限制机器人训练片段长度，默认不裁剪。
-
-本分支新增开发文档统一使用中文，Git commit 信息使用英文。下方保留上游项目介绍。
+NPU 适配沿用 mentor 的 `transfer_to_npu`、HCCL 与稠密 SDPA。六源联合训练默认使用 HumanGen:RoboTwin=4:1、混合来源分桶 10；八卡默认启用动态容量裁剪。
 
 ## Overview
 
@@ -298,9 +291,7 @@ Each task uses the fixed human demonstration in `evaluation/robotwin/robotwin_ic
 
 ## Training
 
-**Ascend 单机八卡交接入口：[lianjie-dev 集群训练说明](docs/cluster-training.md)**，包含训练设计、容量约束、数据准备和启动命令。
-
-从原始 Wan 基座开始训练，请先阅读 [Wan 权重初始化说明](docs/wan-initialization.md)。本地 RoboTwin 数据检查与昇腾启动入口见 [RoboTwin 训练说明](docs/robotwin-wan-training.md)；使用五个外部 HumanGen 来源或六源混训，见 [HumanGen 预训练说明](docs/humangen-wan-training.md)。
+从原始 Wan 开始的 Ascend 六源训练见 [单机八卡训练说明](docs/cluster-training.md)；权重映射见 [Wan 初始化说明](docs/wan-initialization.md)。
 
 下方两种官方训练模式默认从发布的 `zero-wam-pretrain` 权重开始。也可按上方说明，通过 `MODEL_PATH` 指定从 Wan 转换得到的初始化权重。模型和输出路径配置如下：
 

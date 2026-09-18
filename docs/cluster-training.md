@@ -1,4 +1,4 @@
-# lianjie-dev：单机八卡训练交接
+# Ascend 单机八卡训练
 
 此分支交付从原始 Wan 初始化的 HumanGen + RoboTwin 联合训练。目标配置为一台节点上的 **8×Ascend 910B3、每卡 64 GiB**。入口是 `script/train_humangen_wan_npu.sh`，由该入口启动八个训练进程。集群调度器负责分配整台节点/设备；当前入口没有配置多节点 rendezvous。不同硬件、卡数或 FSDP 配置不能直接沿用这份容量标定。
 
@@ -9,7 +9,7 @@
 | 初始化 | 原始 Wan2.2-TI2V-5B 转换，seed 42，FP32 初始化权重；不使用训练后的 Zero-WAM Transformer 初始化 |
 | 数据 | HumanGen 五个外部来源 + RoboTwin 43 个训练任务；7 个测试任务由 manifest 与 loader 双重隔离 |
 | 来源采样 | HumanGen:RoboTwin=4:1；HumanGen 内按论文来源任务数的平方根分配概率；来源内均匀抽样 |
-| 模型与目标 | 视频、动作、4 个 IFP/MCP 模块联合训练；IFP 接收第 3/11/19/29 层特征，各一个 block |
+| 模型与目标 | 视频、动作、4 个 IFP/MCP 模块联合训练；IFP 接收层索引 3/11/19/29 的特征，各一个 block |
 | IFP 损失权重 | 0.5 / 0.25 / 0.15 / 0.1；总损失为视频、动作及加权 IFP 损失之和 |
 | 条件 | 人类视频 dropout 0.1、目标文字 dropout 0.4；human RoPE 偏移 24 |
 | 优化器 | fused AdamW，LR 1e-4，betas 0.9/0.95，weight decay 0.01，预热 200 步后恒定 LR |
@@ -24,13 +24,19 @@
 
 当前 NPU 内存优化还包括：按行分块生成稠密注意力 mask，减少整数临时矩阵；同一步 MCP 各深度复用不可变 mask；NPU 全屏蔽 padding 行输出清零，保持参考输出/梯度语义。分块构建后仍保存完整二维 bool mask，不是稀疏注意力。数据侧保留索引/Arrow 缓存与 manifest 索引复用。单进程数据初始化避免任务对象经多进程返回时复制大型 manifest；训练本身仍为八进程。
 
-完整采样概率与数据范围见 [HumanGen 训练说明](humangen-wan-training.md)，权重映射见 [Wan 初始化说明](wan-initialization.md)。此配方没有补充未公开的 VA-only/内部 HumanGen 数据，没有实现论文的 160K token 多样本打包；RoPE 偏移与 IFP 最后一项损失权重继续沿用公开代码，不能标为完整论文配方复现。
+权重映射见 [Wan 初始化说明](wan-initialization.md)。此配方没有补充未公开的 VA-only/内部 HumanGen 数据，没有实现论文的 160K token 多样本打包；RoPE 偏移与 IFP 最后一项损失权重继续沿用公开代码，不能标为完整论文配方复现。
+
+## 数据采样
+
+默认策略由 [`humangen_robotwin_sampling.json`](../wan_va/configs/humangen_robotwin_sampling.json) 定义，启动时由 `script/resolve_training_sampling.py` 解析。来源概率为：AgiBot 33.1128%、InternData-A1 9.2371%、OXE 11.9661%、RoboCOIN 12.9375%、RoboMind 12.7466%、RoboTwin 20%。任务数是论文完整数据集的先验；来源内部按样本均匀抽取，没有实现严格 task-balanced，也不保证短程抽样数量精确符合概率。
+
+`SAMPLING_CONFIG` 可替换策略 JSON，`DATASETS='agibot:1,interna1:1'` 可显式覆盖来源及相对权重。RoboTwin 始终由 loader 排除七个测试任务。各来源保留自己的相机布局、动作步长、转换配置和归一化统计。
 
 ## 环境与外部资产
 
 Git 分支包含代码、配置、空文本特征和说明。初始化权重、HumanGen 原始数据、可写数据视图、Arrow 缓存、训练输出均不在 Git 中。目标节点必须能访问真实数据及权重；如果共享存储挂载位置不同，应重新运行数据准备脚本，避免复制带有旧主机绝对路径的软链接视图。
 
-使用已经验证过的 Ascend 训练环境。当前本机栈为 Python 3.12.13、PyTorch/torch_npu 2.9.0、CANN 9.1.0、LeRobot 0.3.3；依赖列表见 `requirements-npu.txt`、`pyproject.toml`。LeRobot 的 torch 版本约束与本环境冲突，应在已准备好其依赖的环境中使用 `pip install --no-deps lerobot==0.3.3`，避免自动降级 torch。仓库不提供驱动/CANN；相同路径的 aarch64 共享环境复用见 [共享环境说明](shared-environment.md)。
+使用已经验证过的 Ascend 训练环境。当前本机栈为 Python 3.12.13、PyTorch/torch_npu 2.9.0、CANN 9.1.0、LeRobot 0.3.3；依赖列表见 `requirements-npu.txt`、`pyproject.toml`。LeRobot 的 torch 版本约束与本环境冲突，应在已准备好其依赖的环境中使用 `pip install --no-deps lerobot==0.3.3`，避免自动降级 torch。仓库不提供驱动/CANN，目标节点需要准备兼容环境。
 
 在仓库根目录设置路径；以下 `/cluster/...` 均需替换。`PYTHON_BIN` 指向 mentor 已准备好的环境，不要求目标机器使用本机 `.venv`。
 
@@ -100,10 +106,28 @@ bash script/train_humangen_wan_npu.sh --run
 
 省略 `NUM_STEPS` / `SAVE_INTERVAL` 时仍为 10 步试跑。`LENGTH_BUCKET_STEPS=0` 可关闭分桶；单来源 `DATASETS` 默认不分桶。`MAX_TRAIN_FRAMES` 是可选的额外机器人帧数上限，交接配置未设置。容量配置要求 batch=1、八卡、累积=1、sublayer 和指定模型结构；改变这些设置时不要直接复用标定。`TRAIN_DIAGNOSTICS=1` 可记录逐卡样本/形状/显存，但增加同步和日志开销，正式训练默认关闭。
 
-## 验证与产物
+## 其他入口与检查
 
-最近的八卡真实子集训练已验证裁剪、前向、反向及优化器更新；容量子集和吞吐子集均在用户要求下提前停止，完成范围见 [训练显存与验证记录](training-memory.md)。已有结果不覆盖全量数据、长期收敛、多机或本次八卡配置的 checkpoint 保存阶段，因此目标节点的流程检查保留保存步骤。
+纯 RoboTwin 消融使用 `script/train_robotwin_wan_npu.sh`，只需 RoboTwin 数据准备与检查；该独立入口不自动启用混训入口的容量配置、分桶或诊断选项。原生数据检查脚本分别为 `script/check_humangen_training.py` 与 `script/check_robotwin_training.py`，可通过 `--help` 查看全量检查选项。
+
+开发时可运行 CPU 回归，隔离 Ascend 迁移层的全局 CUDA 替换：
+
+```bash
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 OMP_NUM_THREADS=2 \
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 "${PYTHON_BIN:-python}" - <<'PY'
+import sys
+sys.modules['torch_npu.contrib.transfer_to_npu'] = None
+import pytest
+raise SystemExit(pytest.main(['-q', 'tests', '-k', 'not cuda and not npu']))
+PY
+```
+
+CPU 回归不代替目标设备验证。
+
+## 运行产物与限制
+
+最近的八卡真实子集训练已验证裁剪、前向、反向及优化器更新；容量子集和吞吐子集均在用户要求下提前停止，完成范围见 [容量规则与验证范围](training-memory.md)。已有结果不覆盖全量数据、长期收敛、多机或本次八卡配置的 checkpoint 保存阶段，因此目标节点的流程检查保留保存步骤。
 
 每个运行目录包含 `command.txt`、`sampling.json`、数据/初始化来源、`code-head.txt`、`code-changes.patch`、`source.tar.gz`、`train.log` 和 `metrics.jsonl`。模型权重保存在 `checkpoints/checkpoint_step_N/transformer`。保存间隔需要整除总步数才能在最后一步保存。
 
-当前 checkpoint 是 BF16 模型快照，**没有完整优化器、scheduler、采样器和随机数状态，不支持精确断点续训**。不要把从权重重新启动描述为完整恢复。当前交付也不包含吞吐测试中回退的 timestep embedding / scheduler 实验优化，或尚未验证的 checkpoint/FSDP 粒度变更。
+当前 checkpoint 是 BF16 模型快照，**没有完整优化器、scheduler、采样器和随机数状态，不支持精确断点续训**。不要把从权重重新启动描述为完整恢复。

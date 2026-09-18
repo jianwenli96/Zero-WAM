@@ -18,7 +18,7 @@ if [[ "$MODE" != --dry-run && "$MODE" != --check-only && "$MODE" != --run ]]; th
 fi
 for file in "$MODEL_PATH/transformer/config.json" "$MODEL_PATH/initialization.json" \
             "$HUMANGEN_ROOT/preparation.json" "$HUMANGEN_ROOT/icl_configs/ICL_config_robotwin_train.json"; do
-  test -f "$file" || { echo "Missing $file; follow docs/robotwin-wan-training.md" >&2; exit 1; }
+  test -f "$file" || { echo "Missing $file; follow docs/cluster-training.md" >&2; exit 1; }
 done
 if [[ "$MODE" == --check-only ]]; then
   "$PYTHON_BIN" script/check_robotwin_training.py --root "$HUMANGEN_ROOT"
