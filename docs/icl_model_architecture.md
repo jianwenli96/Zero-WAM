@@ -202,3 +202,42 @@ Dense mask 大小随 `Lq×Lk` 增长，训练时大致随 `(2Lv+Li+2La)^2` 增�
 对 ICL model/dataset/server、training alignment、MCP、dataset index/mixture、Robotwin action、LeRobot action 共九个测试文件进行了 CPU 逻辑验证，筛选条件为 `not cuda and not npu`。首次结果为 63 通过、1 失败、17 个设备用例未选择；失败来自缺少默认 `data/HumanGen` 下的动作统计。用训练脚本一致的 `HUMAN_GEN_ROOT=/mnt/sfs_turbo/public/datasets/HumanGen` 单独复核该用例后通过，因此选定的 64 项均得到通过结果。
 
 训练解释器没有安装 pytest，本次从已有环境临时隔离复制纯 Python 测试工具使用，没有修改训练依赖或业务实现。另检查了三份文档的本地链接及代码围栏。未运行完整规模训练、真实 GPU/NPU attention 测试、跨节点服务或 Robotwin 环境闭环，文中的性能风险属于根据代码结构推导，不是实测 benchmark。
+
+## 13. 原始 Wan → ICL 权重初始化
+
+独立引入 `lianjie-dev` 的 [wan_init.py](../wan_va/wan_init.py)，提供一次性的离线转换入口。无需改动模型前向、训练循环或启动脚本，也不会自动转换已有训练权重。
+
+输入目录必须是原始 Wan TI2V Transformer 权重目录，包含 `model_type: ti2v` 的 `config.json`、`diffusion_pytorch_model.safetensors.index.json` 和对应分片；不直接接受单个无索引的权重文件或已经转换为 Diffusers 格式的目录。目标模型使用当前 ICL 架构，逐项校验映射和尺寸，不承诺适配任意 Wan 变体。
+
+```bash
+# 在项目根目录，使用已安装项目依赖的 Python 环境执行。
+python -m wan_va.wan_init \
+  --source /path/to/original-wan-ti2v \
+  --output /path/to/wan-icl-init \
+  --seed 42 --dtype float32 --shard-size-gb 3
+
+# 转换完成后，现有单机入口直接使用新模型根目录。
+MODEL_PATH=/path/to/wan-icl-init bash script/train.sh
+
+# 集群各节点仍按原方式配置节点数、rank 和主节点地址。
+MODEL_PATH=/path/to/wan-icl-init bash script/train_dist.sh
+```
+
+`--dtype` 支持 `float32`、`bfloat16`，默认 `bfloat16`；float32 可避免转换阶段向 BF16 舍入，但输出更大。转换在 CPU 上执行，先通过 meta device 建立参数结构，再逐项读取和分片写出。`--shard-size-gb` 是十进制 GB 的分片目标大小，单个超大参数不会拆开，并非严格的进程内存上限。
+
+| 权重部分 | 初始化方式 |
+|---|---|
+| 视频主干、视频输出、时间与文本条件 | 复制原始 Wan 对应权重 |
+| 视频 patch 输入 Linear | 将原 Conv3d kernel 按对应 patch 展开顺序 reshape |
+| 动作 attention、FFN、时间条件 | 从对应视频分支复制，独立参数保留独立存储；模型原有共享参数关系不变 |
+| MCP Transformer blocks | 从最后一个视频主干 block 复制；当前仅支持每个 MCP 组一个 block |
+| 动作输入／输出 Linear | 按 `±1/sqrt(fan_in)` 均匀随机初始化，包含 bias |
+| MCP 融合与投影 | weight 使用 std=0.02 的正态初始化，bias 为零 |
+
+新增参数初始化是该工具的工程选择，不是已经验证的最优训练配方。`--seed` 控制随机初始化；同一环境、配置和 seed 可复现转换结果。
+
+输出目录包含 `transformer/config.json`、分片 safetensors 及索引，以及根目录的 `initialization.json`（源路径、seed、dtype、逐参数映射和初始化方式）。源索引、参数尺寸、源参数覆盖与输出分片结构均有检查。已有输出目录拒绝覆盖；转换完成前写入临时目录，失败时清理临时结果。
+
+工具仅转换 Transformer，不复制 VAE、T5 或 tokenizer。训练可直接使用输出目录；完整推理还需匹配的其他组件。刚初始化的动作分支尚未学会机器人控制，不能视为已训练策略，也不恢复 optimizer、学习率或训练步数。
+
+[test_wan_initialization.py](../tests/test_wan_initialization.py) 使用小型合成原始 Wan checkpoint，验证 float32/BF16 转换与当前 ICL 模型重载、参数映射、patch embedding 等价性、动作参数独立与共享关系、随机初始化可复现、拒绝覆盖、异常索引／尺寸和写入失败清理。该测试不代表已转换完整生产权重或验证训练收敛。
