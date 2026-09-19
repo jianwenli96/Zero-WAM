@@ -65,6 +65,8 @@ class DistributedDatasetMixtureSampler(Sampler):
         rank=0,
         seed=42,
         epoch_size=None,
+        sample_costs=None,
+        bucket_steps=0,
     ):
         self.dataset_lengths = [int(length) for length in dataset_lengths]
         self.dataset_weights = torch.as_tensor(
@@ -74,6 +76,15 @@ class DistributedDatasetMixtureSampler(Sampler):
         self.rank = int(rank)
         self.seed = int(seed)
         self.epoch = 0
+        self.bucket_steps = int(bucket_steps)
+        self.sample_costs = sample_costs
+        if self.bucket_steps < 0:
+            raise ValueError('bucket_steps must be nonnegative')
+        if self.bucket_steps:
+            if sample_costs is None or len(sample_costs) != sum(self.dataset_lengths):
+                raise ValueError('sample_costs must cover every dataset index')
+            if any(not math.isfinite(c) or c <= 0 for c in sample_costs):
+                raise ValueError('sample_costs must be finite and positive')
 
         if not self.dataset_lengths:
             raise ValueError("At least one dataset is required")
@@ -130,6 +141,27 @@ class DistributedDatasetMixtureSampler(Sampler):
             )
             indices[positions] = local_indices + offset
 
+        if self.bucket_steps > 1:
+            # Reorder only within bounded windows of the *same* weighted draws.
+            # Group similarly expensive samples in each distributed microbatch,
+            # then shuffle the groups so training does not progress short->long.
+            # Counts, replacement sampling and equal rank lengths are unchanged.
+            ordered = indices.tolist()
+            window = self.bucket_steps * self.num_replicas
+            for start in range(0, self.total_size, window):
+                chunk = sorted(ordered[start:start + window],
+                               key=lambda index: self.sample_costs[index])
+                groups = [chunk[i:i + self.num_replicas]
+                          for i in range(0, len(chunk), self.num_replicas)]
+                group_order = torch.randperm(len(groups), generator=generator).tolist()
+                reordered = []
+                for group_id in group_order:
+                    group = groups[group_id]
+                    # Avoid consistently assigning the longest item to rank N-1.
+                    rank_order = torch.randperm(len(group), generator=generator).tolist()
+                    reordered.extend(group[i] for i in rank_order)
+                ordered[start:start + len(chunk)] = reordered
+            indices = torch.tensor(ordered, dtype=torch.long)
         rank_indices = indices[self.rank : self.total_size : self.num_replicas]
         return iter(rank_indices.tolist())
 

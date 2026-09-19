@@ -196,7 +196,7 @@ required_action_rows = F_latent*A
 
 ## 8. 从 batch 到 Flow Matching 输入
 
-`convert_input_format` 将 batch 顶层 tensor 移到训练设备。`_prepare_input_dict` 随机选择 chunk/window，并分别为视频、动作采样逐帧 timestep 和高斯噪声。
+先在 CPU 上对齐裁剪机器人窗口，再由 `convert_input_format` 将 batch 顶层 tensor 移到训练设备。`_prepare_input_dict` 随机选择 chunk/window，并分别为视频、动作采样逐帧 timestep 和高斯噪声。
 
 [FlowMatchScheduler](../wan_va/utils/scheduler.py) 对基础 sigma 做 shift：
 
@@ -281,3 +281,34 @@ Checkpoint 获取完整 FSDP state dict、CPU offload、转 BF16，解除共享 
 此项不分配 GPU/NPU tensor，**不直接节省显存**，主要改善 CPU 初始化开销。共享索引可减少重复 Python 对象，但 LRU 也会保留最近使用的对象，不能保证总主机内存一定下降。缓存是每进程独立的，不是跨 worker／节点共享；若文件内容变化但大小和时间均被刻意保持，需清理缓存或重启进程。
 
 单机与集群训练均自动使用此优化，无需修改启动参数。验证见 [test_manifest_cache.py](../tests/test_manifest_cache.py)：重复解析消除、路径别名复用，以及时间／大小变更后的失效。
+
+## 13. 混合数据集长度分桶
+
+`length_bucket_steps` 当前配置默认值为 8；未显式传入 `--length-bucket-steps` 时使用配置文件的值，设为 0 可关闭分桶。启用后 rank 0 读取 latent archive 元数据估计各样本 token 成本，广播给其他 rank；在有限分布式 microbatch 窗口内重排同一批加权抽样结果，使同一步各 rank 成本更接近。不会筛掉样本或修改各数据集抽样权重，但样本顺序会改变。仅支持混合数据集；负数或单数据集启用会报错。
+
+在 `zerowam_train_config.py` 中设置 `zerowam_train_cfg.length_bucket_steps = 8`，并使用 `DATASETS='robotwin:1,agibot:1' bash script/train.sh`；集群入口读取同一配置。CLI 同名参数仅在显式传入时覆盖配置文件。机器人动作成本按每 latent 帧 16 token 近似，人类条件按完整序列估计，因此是调度估计，不是耗时或显存保证。首次启用增加元数据扫描开销，rank 0 扫描异常会通知其他 rank 一起退出。
+
+测试见 `tests/test_length_bucketing.py`：抽样多重集合与 rank 长度不变、epoch 可复现、组内估计成本差异下降、非法成本检查，以及不加载 tensor storage 的成本读取。
+
+## 14. 对齐的随机机器人窗口
+
+`max_train_frames` 当前配置默认值为 64 个机器人 latent 帧；未显式传入 `--max-train-frames` 时使用配置文件的值。启用时在设备传输之前，用同一个随机连续 latent 帧窗口裁剪机器人视频、动作和动作 mask；人类示范及文本完整保留。短样本不裁剪，非正上限报错。原始 batch 不因裁剪而被修改。
+
+例如在 `zerowam_train_config.py` 中设置 `zerowam_train_cfg.max_train_frames = 32`，单机与集群均读取该设置。这里是 latent 帧数，不是原始 RGB 帧数。仅 rank 0 在发生裁剪时记录本 rank 的随机起点与长度。动作已经经过处理，窗口起点不会重新设定坐标参考或补零；MCP 未来目标随后基于裁剪后的窗口构建。
+
+减少 token 可降低计算和显存，但改变训练时序上下文与有效 MCP 目标数量；不能视为无损提速。超出窗口长度的未来目标可能全部被 mask，效果需评测。
+
+## 15. 训练效率配置
+
+两项配置统一维护在 `wan_va/configs/zerowam_train_config.py`。当前默认配置（实际取值以配置文件为准）：
+
+```python
+zerowam_train_cfg.length_bucket_steps = 8
+zerowam_train_cfg.max_train_frames = 64
+```
+
+`length_bucket_steps=0` 关闭分桶，`max_train_frames=None` 不裁剪。裁剪只使用手动帧数上限，保留完整人类示范；不再包含经验容量 JSON 或按 token 预算动态计算窗口的功能。
+
+两个 launcher 仅透传显式 CLI 参数，不自动拼接这些配置。Python CLI 未传入时读取配置文件。单机与集群训练均使用同一逻辑，不存在容量 profile 带来的 world_size 限制。
+
+测试覆盖配置优先级、分桶采样组成、FSDP 边界、固定窗口裁剪对齐与小模型训练步／梯度累积。设备被其他训练占用时仅运行 CPU 测试，不将结果视为多卡吞吐或显存保证。

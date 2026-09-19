@@ -43,7 +43,7 @@ va_robotwin_train_cfg.empty_emb_path = va_robotwin_cfg.empty_text_emb_path
 va_robotwin_train_cfg.save_root = os.environ.get(
     'ZERO_WAM_SAVE_ROOT', '/path/to/your/output'
 )
-va_robotwin_train_cfg.init_worker = 1
+va_robotwin_train_cfg.init_worker = 8
 va_robotwin_train_cfg.load_worker = 16
 va_robotwin_train_cfg.save_interval = 1000
 va_robotwin_train_cfg.gc_interval = 50
@@ -59,4 +59,4 @@ va_robotwin_train_cfg.max_norm = 1.0
 va_robotwin_train_cfg.skip_step_grad_norm_multiplier = 20.0
 va_robotwin_train_cfg.batch_size = 1
 va_robotwin_train_cfg.gradient_accumulation_steps = 1
-va_robotwin_train_cfg.num_steps = 50000
+va_robotwin_train_cfg.num_steps = 20000

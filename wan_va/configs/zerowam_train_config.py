@@ -29,3 +29,8 @@ zerowam_train_cfg.frame_chunk_size = 0
 zerowam_train_cfg.max_frame_chunk_size = 4
 zerowam_train_cfg.attn_window = 0
 zerowam_train_cfg.max_attn_window = 64
+
+
+# Training efficiency
+zerowam_train_cfg.length_bucket_steps = 8  # 0 disables; positive values require a dataset mixture.
+zerowam_train_cfg.max_train_frames = 60  # Optional positive robot latent-frame cap.

@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import time
 from copy import deepcopy
 from datetime import datetime, timezone
 import os
@@ -59,6 +60,7 @@ from .dataset import (
     normalized_dataset_weights,
     parse_dataset_mixture,
 )
+from .dataset.data_efficiency import crop_training_batch, training_sample_costs
 from .mcp import shift_latents_for_mcp, validate_mcp_settings
 from .utils.logging import add_file_logger
 import gc
@@ -81,6 +83,9 @@ def _build_dataset_sources(config, args, rank, local_rank, world_size):
         args.datasets,
         available_names=TRAIN_DATASET_CONFIGS,
     )
+    bucket_steps = getattr(config, 'length_bucket_steps', 0)
+    if bucket_steps < 0 or (bucket_steps and len(entries) == 1):
+        raise ValueError('Length bucketing requires nonnegative steps and a weighted dataset mixture')
     path_overrides = {
         key: getattr(args, key)
         for key in _DATASET_PATH_OVERRIDES
@@ -271,10 +276,9 @@ class Trainer:
         apply_ac(self.transformer)
 
         logger.info("Setting up FSDP...")
-        shard_fn = shard_model
         self.transformer = _configure_model(
             model=self.transformer,
-            shard_fn=shard_fn,
+            shard_fn=shard_model,
             param_dtype=self.dtype,
             device=self.device,
             eval_mode=False,
@@ -366,6 +370,38 @@ class Trainer:
                 train_dataset.index_cache_misses,
             )
             logger.info("Dataset sampling probabilities: %s", mixture)
+        bucket_steps = int(getattr(config, 'length_bucket_steps', 0))
+        if bucket_steps < 0:
+            raise ValueError('length_bucket_steps must be nonnegative')
+        if bucket_steps and len(dataset_sources) == 1:
+            raise ValueError('Length bucketing currently requires a weighted dataset mixture')
+        sample_costs = None
+        if bucket_steps:
+            cost_tensor = torch.zeros(len(train_dataset), device=self.device,
+                                      dtype=torch.float32)
+            cost_error = torch.zeros(1, device=self.device, dtype=torch.int)
+            if config.rank == 0:
+                try:
+                    cost_started = time.perf_counter()
+                    sample_costs = training_sample_costs(
+                        train_dataset, getattr(config, 'max_train_frames', None),
+                        self.patch_size,
+                    )
+                    cost_tensor.copy_(torch.tensor(sample_costs, device=self.device))
+                    logger.info('Built %d sample costs in %.2fs; bucket window=%d steps',
+                                len(sample_costs), time.perf_counter() - cost_started,
+                                bucket_steps)
+                except Exception:
+                    logger.exception('Could not build sample costs')
+                    cost_error.fill_(1)
+            if dist.is_initialized():
+                dist.broadcast(cost_error, src=0)
+            if cost_error.item():
+                raise RuntimeError('Sample cost indexing failed; see rank zero log')
+            if dist.is_initialized():
+                dist.broadcast(cost_tensor, src=0)
+            sample_costs = cost_tensor.cpu().tolist()
+            del cost_tensor, cost_error
         if len(dataset_sources) > 1:
             train_sampler = DistributedDatasetMixtureSampler(
                 dataset_lengths=train_dataset.dataset_lengths,
@@ -373,6 +409,8 @@ class Trainer:
                 num_replicas=config.world_size,
                 rank=config.rank,
                 seed=42,
+                sample_costs=sample_costs,
+                bucket_steps=bucket_steps,
             )
         elif config.world_size > 1:
             train_sampler = DistributedSampler(
@@ -692,6 +730,11 @@ class Trainer:
 
     def _train_step(self, batch, batch_idx):
         """Train a single batch, returns losses for logging."""
+        batch = crop_training_batch(
+            batch, getattr(self.config, 'max_train_frames', None))
+        window_crop = batch.get('_window_crop')
+        if window_crop is not None and self.config.rank == 0:
+            logger.info('Random robot window rank=%s: %s', self.config.rank, window_crop)
         batch = self.convert_input_format(batch)
         input_dict = self._prepare_input_dict(batch)
         
@@ -719,6 +762,7 @@ class Trainer:
             'action_loss': action_loss.detach(),
             'mcp_losses': [depth_loss.detach() for depth_loss in mcp_losses],
             'mcp_loss': mcp_loss.detach(),
+            'window_crop': window_crop,
         }
         
         # Only update weights after accumulating gradients
@@ -977,10 +1021,14 @@ def run(args):
         'num_steps': args.num_steps,
         'save_interval': args.save_interval,
         'save_root': args.save_root,
+        'max_train_frames': getattr(args, 'max_train_frames', None),
+        'length_bucket_steps': getattr(args, 'length_bucket_steps', None),
     }
     for key, value in overrides.items():
         if value is not None:
             config[key] = value
+    if getattr(config, 'max_train_frames', None) is not None and config.max_train_frames <= 0:
+        raise ValueError('max_train_frames must be positive')
     config.cfg_prob = config.droptext_target
 
     if args.disable_wandb:
@@ -1089,6 +1137,12 @@ def main():
         "--gradient-accumulation-steps", type=int, default=None)
     parser.add_argument("--num-steps", type=int, default=None)
     parser.add_argument("--save-interval", type=int, default=None)
+
+    parser.add_argument('--length-bucket-steps', type=int, default=None,
+                        help='Cost grouping window in distributed microbatches; mixtures only, 0 disables')
+
+    parser.add_argument('--max-train-frames', type=int, default=None,
+                        help='Optional aligned robot frame crop; full human ICL retained')
 
     args = parser.parse_args()
     run(args)

@@ -11,17 +11,12 @@ PORT=${PORT:-"1106"}
 LOG_RANK=${LOG_RANK:-"0"}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 CONFIG_NAME=${CONFIG_NAME:-"robotwin_train"} # MCP is enabled for all training configs
-DATASETS=${DATASETS:-"robotwin:1.0"}
+DATASETS=${DATASETS:-"robotwin:1.0,agibot:1.0"}
 
 # 将模型路径替换为实际位置
 export MODEL_PATH="${MODEL_PATH:-/mnt/sfs_turbo/public/ckpts/Zero-WAM/zero-wam-scratch}"
 export ZERO_WAM_SAVE_ROOT="${ZERO_WAM_SAVE_ROOT:-/mnt/sfs_turbo/lijianwen/Codes/Zero-WAM/outputs/robotwin_train}"
 export HUMAN_GEN_ROOT="${HUMAN_GEN_ROOT:-/mnt/sfs_turbo/public/datasets/HumanGen}"
-
-overrides=""
-if [ $# -ne 0 ]; then
-    overrides="$*"
-fi
 
 ## node setting
 num_gpu=${NGPU}
@@ -44,4 +39,4 @@ exec "${PYTHON_BIN}" -m torch.distributed.run \
     --local-ranks-filter=${log_rank} \
     --master_port ${master_port} \
     --tee 3 \
-    -m wan_va.train --config-name ${config_name} --datasets "${datasets}" $overrides
+    -m wan_va.train --config-name ${config_name} --datasets "${datasets}" "$@"

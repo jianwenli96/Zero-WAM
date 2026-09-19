@@ -83,7 +83,7 @@ def test_wan_conversion_preserves_video_and_initializes_independent_experts(tmp_
         json.dumps(dict(weight_map={k: 'source.safetensors' for k in original})))
     def fail_write(*args, **kwargs):
         raise OSError('simulated disk failure')
-    monkeypatch.setattr('wan_va.wan_init.save_file', fail_write)
+    monkeypatch.setattr('wan_va.wan_weight_init.save_file', fail_write)
     with pytest.raises(OSError, match='simulated disk failure'):
         convert(source, tmp_path / 'failed', config=config)
     assert not (tmp_path / 'failed').exists()
