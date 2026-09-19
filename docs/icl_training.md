@@ -273,3 +273,11 @@ Checkpoint 获取完整 FSDP state dict、CPU offload、转 BF16，解除共享 
 还有一个元数据边界：初始化虽然用 `action_config` 筛选了待加载 episodes，但 `parse_meta` 重建索引时遍历的仍是完整 `self.meta.episodes`，并直接访问 `value['action_config']`。若混入完全缺少该键的 episode，仍可能出现 KeyError；不能把前面的筛选视为对所有不完整元数据的容错。
 
 源码已有 [dataset index 测试](../tests/test_dataset_index_cache.py)、[ICL dataset 测试](../tests/test_icl_dataset.py)、[混合采样测试](../tests/test_dataset_mixture.py)、[Robotwin 动作测试](../tests/test_robotwin_action.py)、[元数据动作测试](../tests/test_lerobot_action.py)、[训练对齐测试](../tests/test_training_alignment.py)。这些测试支持局部契约；真实数据完整性、跨节点文件可见性、收敛和吞吐仍需专门验证。
+
+## 12. 独立引入 B1：manifest 进程内缓存
+
+`load_icl_manifest()` 以解析后的绝对路径、`mtime_ns` 和文件大小为键，使用最多 8 项的 LRU 缓存。一个进程中的任务数据集共享只读索引，减少同一个大 JSON 的重复读取、解析和索引构建；文件时间或大小变化后重新解析。
+
+此项不分配 GPU/NPU tensor，**不直接节省显存**，主要改善 CPU 初始化开销。共享索引可减少重复 Python 对象，但 LRU 也会保留最近使用的对象，不能保证总主机内存一定下降。缓存是每进程独立的，不是跨 worker／节点共享；若文件内容变化但大小和时间均被刻意保持，需清理缓存或重启进程。
+
+单机与集群训练均自动使用此优化，无需修改启动参数。验证见 [test_manifest_cache.py](../tests/test_manifest_cache.py)：重复解析消除、路径别名复用，以及时间／大小变更后的失效。

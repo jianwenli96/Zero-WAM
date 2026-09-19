@@ -9,7 +9,7 @@ import json
 import os
 import re
 from bisect import bisect_right
-from functools import partial
+from functools import lru_cache, partial
 from multiprocessing import Pool
 from pathlib import Path
 
@@ -57,6 +57,14 @@ def _episode_key_without_interval(value):
 
 
 def load_icl_manifest(path):
+    path = Path(path).resolve()
+    stat = path.stat()
+    return _load_icl_manifest_cached(str(path), stat.st_mtime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=8)
+def _load_icl_manifest_cached(path, mtime_ns, size):
+    # Task datasets in one worker share read-only indexes. Refresh on file edits.
     with Path(path).open(encoding="utf-8") as handle:
         payload = json.load(handle)
     samples = payload.get("samples", []) if isinstance(payload, dict) else []
