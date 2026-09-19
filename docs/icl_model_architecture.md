@@ -241,3 +241,25 @@ MODEL_PATH=/path/to/wan-icl-init bash script/train_dist.sh
 工具仅转换 Transformer，不复制 VAE、T5 或 tokenizer。训练可直接使用输出目录；完整推理还需匹配的其他组件。刚初始化的动作分支尚未学会机器人控制，不能视为已训练策略，也不恢复 optimizer、学习率或训练步数。
 
 [test_wan_initialization.py](../tests/test_wan_initialization.py) 使用小型合成原始 Wan checkpoint，验证 float32/BF16 转换与当前 ICL 模型重载、参数映射、patch embedding 等价性、动作参数独立与共享关系、随机初始化可复现、拒绝覆盖、异常索引／尺寸和写入失败清理。该测试不代表已转换完整生产权重或验证训练收敛。
+
+
+## 14. 独立引入 B2：dense mask 分块构建
+
+CPU/NPU 的 dense mask 在 `Q*K > 64*1024*1024` 时，按 query 行分块计算同一可见性谓词；每块目标不超过 `4*1024*1024` 个元素（至少一行）。小 mask 保持直接构建，CUDA BlockMask 路径不变。修改仅涉及 `_build_mask()`，没有引入全遮挡行处理等其他功能。
+
+显存收益来自中间矩阵：例如训练谓词的帧差与绝对值原本是完整 Q×K 的整数张量，分块后只需 tile 大小。**最终 bool mask 仍占 Q×K 字节**，所以不能解决最终 mask 本身过大的问题，也不保证整步训练的峰值同比下降。
+
+引入前用同一训练谓词做 CPU 独立进程对照：Q=K=9216，最终 mask 均为 81 MiB，允许的 token 对均为 13,926,369；构造阶段的进程峰值 RSS 从约 1885 MiB 降至 1282 MiB。该数值包含 Python/PyTorch 基线，只证明主机端构造内存改善，不是 NPU 显存测量。校验求和另行执行，不计入构造阶段峰值。
+
+当时 8 张 NPU 均有活跃训练，未追加设备负载；NPU 的临时张量节省依据相同分块算法与 tensor 元素数分析，实际整步峰值需空闲设备复核。[test_dense_mask_tiling.py](../tests/test_dense_mask_tiling.py) 验证训练、streaming、cross 三类谓词在不同窗口下与直接构建逐元素一致，并检查 tile 大小边界。单机、集群入口自动生效，无需新增参数。
+
+
+## 15. 独立引入 B3：MCP 组间复用 mask
+
+各 MCP 分支的未来偏移影响 RoPE 和加噪，但当前实现使用相同的 target/action 帧号、sequence/noise/type/ICL 标记及文本 sequence 标记建立可见性 mask。每次 forward 只为第一个 MCP 组构建 self/cross mask，其余组引用同一对不可变对象；主干仍使用自己的 mask。不同 forward 重新构建，避免窗口或样本变化后误用旧结果。
+
+对 M 个 MCP 组，dense mask 的常驻存储由 M 份降为 1 份。若包含 padding 的 MCP token 数为 L、文本 token 数为 T，bool 元素为 1 字节，理论减少 `(M-1)*(L*L+L*T)` 字节。默认 4 组减少 **75% 的 MCP mask 存储**；例如 L=16384、T=512 时减少 792 MiB。该比例不适用于总训练显存，参数、激活、attention 内部临时张量等仍然存在。CUDA 的 BlockMask 同样复用，但上述字节公式仅针对 dense mask。
+
+[test_mcp_mask_sharing.py](../tests/test_mcp_mask_sharing.py) 覆盖 4 组 MCP、不同未来偏移、连续两次不同窗口／长度输入、独立存储对照、全部参与训练参数的梯度，以及开启／关闭 activation checkpointing。另以修改前模型源码作 CPU 对照，两种 checkpointing 设置下 mask、输出和梯度均精确一致。未在占用中的 NPU 上实测整步峰值。
+
+本项自动应用于单机和集群训练，不新增启动参数、不改变 checkpoint 参数结构。B1/B2/B3 的定向回归共 41 项通过（11 项数据测试、21 项 mask/模型 CPU 测试、9 项 MCP 测试）；设备用例本次未运行。新增说明在现有文档内维护，没有引入其他训练优化或全遮挡行修复。

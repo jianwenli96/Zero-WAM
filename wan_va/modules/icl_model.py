@@ -30,6 +30,9 @@ from torch.nn.attention.flex_attention import (
 from .model import WanRotaryPosEmbed, WanTimeTextImageEmbedding
 
 
+_DENSE_MASK_DIRECT_ELEMENTS = 64 * 1024 * 1024
+_DENSE_MASK_TILE_ELEMENTS = 4 * 1024 * 1024
+
 ICL_CACHE_TYPE = 2
 PREDICTION_CACHE_TYPE = 1
 OBSERVATION_CACHE_TYPE = 0
@@ -63,10 +66,19 @@ class ICLAttentionBackend:
     def _build_mask(mask_mod, query_length, key_length, device, compile_mask):
         device = torch.device(device)
         if device.type != "cuda":
-            q_idx = torch.arange(query_length, device=device)[:, None]
             kv_idx = torch.arange(key_length, device=device)[None, :]
             index = torch.zeros((), device=device, dtype=torch.long)
-            return mask_mod(index, index, q_idx, kv_idx)[None, None]
+            if query_length * key_length <= _DENSE_MASK_DIRECT_ELEMENTS:
+                q_idx = torch.arange(query_length, device=device)[:, None]
+                return mask_mod(index, index, q_idx, kv_idx)[None, None]
+            # Keep the final bool mask; bound temporary predicate matrices.
+            rows = max(1, min(query_length, _DENSE_MASK_TILE_ELEMENTS // max(key_length, 1)))
+            mask = torch.empty((query_length, key_length), device=device, dtype=torch.bool)
+            for start in range(0, query_length, rows):
+                stop = min(start + rows, query_length)
+                q_idx = torch.arange(start, stop, device=device)[:, None]
+                mask[start:stop] = mask_mod(index, index, q_idx, kv_idx)
+            return mask[None, None]
         mask_builder = _compiled_create_block_mask if compile_mask else create_block_mask
         return mask_builder(
             mask_mod, 1, 1, query_length, key_length,
@@ -871,7 +883,7 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
         encoder_seq_ids,
         window_size,
         blocks,
-    ) -> None:
+    ):
         self_mask = ICLAttentionBackend.build_training_self_mask(
             seq_ids=seq_ids,
             frame_ids=frame_ids,
@@ -887,6 +899,7 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
             device=seq_ids.device,
         )
         self._set_masks(blocks, self_mask, cross_mask)
+        return self_mask, cross_mask
 
     def _forward_training_mcp(
         self,
@@ -977,17 +990,16 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
             type_ids = self._pad_metadata(type_ids, padded_length)
             icl_ids = self._pad_metadata(icl_ids, padded_length)
             cross_seq_ids = self._pad_metadata(cross_seq_ids, padded_length)
-            self._build_training_masks(
-                seq_ids,
-                frame_ids,
-                noise_ids,
-                type_ids,
-                icl_ids,
-                cross_seq_ids,
-                encoder_seq_ids,
-                input_dict["window_size"],
-                group,
-            )
+            # Future offsets change RoPE/noising, not visibility metadata.
+            # Share immutable masks only within this forward, including AC.
+            if module_index == 0:
+                mcp_masks = self._build_training_masks(
+                    seq_ids, frame_ids, noise_ids, type_ids, icl_ids,
+                    cross_seq_ids, encoder_seq_ids,
+                    input_dict["window_size"], group,
+                )
+            else:
+                self._set_masks(group, *mcp_masks)
 
             mcp_timestep_proj = torch.cat(
                 [future_timestep_proj, target_clean_timestep_proj], dim=1
