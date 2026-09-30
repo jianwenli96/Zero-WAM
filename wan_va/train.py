@@ -61,6 +61,7 @@ from .dataset import (
     parse_dataset_mixture,
 )
 from .dataset.data_efficiency import crop_training_batch, training_sample_costs
+from .ablations import apply_ablation_flags
 from .mcp import shift_latents_for_mcp, validate_mcp_settings
 from .utils.logging import add_file_logger
 import gc
@@ -111,6 +112,7 @@ def _build_dataset_sources(config, args, rank, local_rank, world_size):
         dataset_config.empty_emb_path = config.empty_emb_path
         dataset_config.init_worker = config.init_worker
         dataset_config.cfg_prob = config.droptext_target
+        dataset_config.enable_text = getattr(config, 'enable_text', True)
         dataset_config.rank = rank
         dataset_config.local_rank = local_rank
         dataset_config.world_size = world_size
@@ -560,7 +562,8 @@ class Trainer:
 
         action_dict['actions_mask'] = batch_dict['actions_mask']
 
-        use_icl = torch.rand(1).item() >= float(self.config.drop_icl)
+        use_icl = (getattr(self.config, 'enable_human_video', True)
+                   and torch.rand(1).item() >= float(self.config.drop_icl))
         icl_latent_dict = None
         target_text_emb = batch_dict['text_emb']
         target_text_length = target_text_emb.shape[1]
@@ -1029,7 +1032,7 @@ def run(args):
             config[key] = value
     if getattr(config, 'max_train_frames', None) is not None and config.max_train_frames <= 0:
         raise ValueError('max_train_frames must be positive')
-    config.cfg_prob = config.droptext_target
+    apply_ablation_flags(config, args)
 
     if args.disable_wandb:
         config.enable_wandb = False
@@ -1055,6 +1058,16 @@ def run(args):
     try:
         _prepare_run_directory(config)
         file_handler = add_file_logger(config.save_root, rank)
+        if rank == 0:
+            ablations = {key: getattr(config, key, True) for key in
+                         ('enable_human_video', 'enable_text', 'enable_mcp')}
+            ablations.update(datasets=args.datasets,
+                             length_bucket_steps=config.length_bucket_steps,
+                             droptext_target=config.droptext_target,
+                             drop_icl=config.drop_icl)
+            with open(Path(config.save_root) / 'ablations.json', 'w') as handle:
+                json.dump(ablations, handle, indent=2)
+            logger.info("Ablation settings: %s", ablations)
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
         if rank == 0:
             logger.info(f"Using config: {args.config_name}")
@@ -1127,6 +1140,14 @@ def main():
         action="store_true",
         help="Disable Weights & Biases logging",
     )
+    parser.add_argument('--disable-human-video', action='store_true',
+                        help='Remove human ICL conditioning; retain target text')
+    parser.add_argument('--disable-text', action='store_true',
+                        help='Replace both target and human text with null embeddings')
+    parser.add_argument('--disable-mcp', action='store_true',
+                        help='Remove MCP modules, schedulers, and auxiliary losses')
+    parser.add_argument('--robotwin-only', action='store_true',
+                        help='Select only HumanGen Robotwin and disable mixture bucketing')
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--droptext-target", type=float, default=None)
     parser.add_argument("--drop-icl", type=float, default=None)

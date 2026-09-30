@@ -299,6 +299,9 @@ class ICLLeRobotLatentDataset(LatentLeRobotDataset):
         item = super().__getitem__(idx)
         human_latent_file = self._human_latent_file(sample)
         icl_latents, icl_text_emb = self._load_human_latent(human_latent_file)
+        if not getattr(self.config, 'enable_text', True):
+            item['text_emb'] = self.empty_emb
+            icl_text_emb = self.empty_emb
         item.update(
             icl_latents=icl_latents,
             icl_text_emb=icl_text_emb,

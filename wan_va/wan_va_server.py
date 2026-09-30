@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+from copy import deepcopy
 import os
 import time
 from functools import partial
@@ -102,7 +103,8 @@ class VA_Server:
             resolve_model_component(model_root, 'transformer'),
             torch_dtype=self.dtype,
             torch_device=self.device,
-            disable_mcp=not self.use_icl_model,
+            disable_mcp=(not self.use_icl_model or
+                         not getattr(job_config, 'enable_mcp', True)),
             icl_model=self.use_icl_model,
         )
         shard_fn = shard_model
@@ -539,6 +541,8 @@ class VA_Server:
             raise ValueError(
                 f"ICL latent has {latent.shape[1]} channels; expected {expected_channels}"
             )
+        if not getattr(self.job_config, 'enable_text', True):
+            text_emb = self.negative_prompt_embeds
         text_emb = self.prompt_embeds if text_emb is None else text_emb.to(self.device)
         latent = latent.to(device=self.device, dtype=self.dtype)
         patch_size = self.transformer.patch_size
@@ -593,7 +597,8 @@ class VA_Server:
         video_guidance_scale,
         icl_guidance_scale,
     ):
-        if not prompt:
+        enable_text = getattr(self.job_config, 'enable_text', True)
+        if enable_text and not prompt:
             raise ValueError("Robotwin ICL inference requires a prompt")
         self.chunk_idx = 0
         self.init_latent = None
@@ -627,7 +632,7 @@ class VA_Server:
         self.action_norm_method = self.job_config.action_norm_method
 
         self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
-            prompt=prompt,
+            prompt=prompt if enable_text else "",
             negative_prompt="",
             do_classifier_free_guidance=True,
             max_sequence_length=512,
@@ -636,12 +641,15 @@ class VA_Server:
         )
         if self.empty_text_emb is not None:
             self.negative_prompt_embeds = self.empty_text_emb.clone()
-        self.use_icl = bool(use_icl)
+        if not enable_text:
+            self.prompt_embeds = self.negative_prompt_embeds.clone()
+        self.use_icl = bool(use_icl) and getattr(
+            self.job_config, 'enable_human_video', True)
         self.video_guidance_scale = float(video_guidance_scale)
         self.icl_guidance_scale = float(icl_guidance_scale)
         self.use_icl_cfg = self.use_icl and self.icl_guidance_scale > 1.0
         self.target_text_cfg_active = (
-            not self.use_icl_cfg and self.video_guidance_scale > 1.0
+            enable_text and not self.use_icl_cfg and self.video_guidance_scale > 1.0
         )
         self.target_prompt_embeds = (
             self.negative_prompt_embeds
@@ -1233,7 +1241,16 @@ class VA_Server:
 
 def run(args):    
     
-    config = VA_CONFIGS[args.config_name]
+    config = deepcopy(VA_CONFIGS[args.config_name])
+    for name in ('human_video', 'text', 'mcp'):
+        if getattr(args, f'disable_{name}', False):
+            config[f'enable_{name}'] = False
+    logger.info(
+        "Inference conditioning: human_video=%s, text=%s, mcp=%s",
+        getattr(config, 'enable_human_video', True),
+        getattr(config, 'enable_text', True),
+        getattr(config, 'enable_mcp', True),
+    )
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
@@ -1278,6 +1295,12 @@ def main():
         default=None,
         help='save root'
     )
+    parser.add_argument('--disable-human-video', action='store_true',
+                        help='Disable human video and its cached text conditioning')
+    parser.add_argument('--disable-text', action='store_true',
+                        help='Use null embeddings for both target and human text')
+    parser.add_argument('--disable-mcp', action='store_true',
+                        help='Disable MCP modules when loading the model')
     args = parser.parse_args()
     run(args)
     logger.info("Finish all process!!!!!!!!!!!!")

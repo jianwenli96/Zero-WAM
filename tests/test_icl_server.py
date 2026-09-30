@@ -144,3 +144,17 @@ def test_icl_cfg_does_not_duplicate_observed_action_branch():
     assert video_call[2]["latent_res_lst"]["noisy_latents"].shape[2] == 4
     assert action_call[2]["action_res_lst"]["noisy_latents"].shape[2] == 2
     assert torch.all(action_call[2]["current_seq_ids"] == 0)
+
+
+def test_video_only_does_not_cache_human_instruction():
+    server = _mock_server()
+    server.job_config.enable_text = False
+    server.job_config.icl_rope_h = 24
+    server.vae = SimpleNamespace(config=SimpleNamespace(latents_mean=[0] * 48))
+    server.prompt_embeds = torch.ones(1, 2, 8) * 7
+    server.negative_prompt_embeds = torch.ones(1, 2, 8) * -3
+    server._load_or_encode_icl = lambda *_: (
+        torch.ones(1, 48, 1, 1, 1), torch.ones(1, 2, 8) * 9)
+    server._cache_icl_context('', '')
+    cached = server.transformer.calls[0][2]
+    torch.testing.assert_close(cached['text_emb'], server.negative_prompt_embeds)

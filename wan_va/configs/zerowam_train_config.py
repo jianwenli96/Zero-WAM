@@ -4,7 +4,9 @@ from easydict import EasyDict
 
 zerowam_train_cfg = EasyDict()
 
-# Zero-WAM always trains the video, action, ICL, and MCP branches together.
+# Baseline enables all conditioning and MCP; CLI ablations override independently.
+zerowam_train_cfg.enable_human_video = True
+zerowam_train_cfg.enable_text = True
 zerowam_train_cfg.enable_wandb = True
 zerowam_train_cfg.wandb_mode = 'offline'
 zerowam_train_cfg.enable_mcp = True

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 import wan_va.train as train_module
 from wan_va.configs.va_robotwin_train_cfg import va_robotwin_train_cfg
@@ -69,7 +70,9 @@ def test_training_loss_uses_global_masked_mean():
     torch.testing.assert_close(latent_loss, torch.tensor(3.0))
     torch.testing.assert_close(action_loss, torch.tensor(2.0 / 3.0))
 
-def test_action_noise_input_is_not_zeroed_by_loss_mask(monkeypatch):
+@pytest.mark.parametrize('enable_human_video,drop_icl', [(True, 1.0), (False, 0.0)])
+def test_action_noise_input_is_not_zeroed_by_loss_mask(
+        monkeypatch, enable_human_video, drop_icl):
     calls = []
 
     def fixed_timestep_ids(**kwargs):
@@ -89,7 +92,8 @@ def test_action_noise_input_is_not_zeroed_by_loss_mask(monkeypatch):
         noisy_img_prob=1.0,
         noisy_cond_min_timestep_bd=0.0,
         noisy_cond_max_timestep_bd=1.0,
-        drop_icl=1.0,
+        drop_icl=drop_icl,
+        enable_human_video=enable_human_video,
         icl_rope_h=24,
         attn_window=4,
         max_attn_window=64,
@@ -103,6 +107,8 @@ def test_action_noise_input_is_not_zeroed_by_loss_mask(monkeypatch):
 
     prepared = trainer._prepare_input_dict(batch)
 
+    assert prepared["icl_latent_dict"] is None
+    torch.testing.assert_close(prepared["text_emb"], batch["text_emb"])
     expected_action_grid = train_module.get_mesh_id(
         2, 1, 1, t=1, action=False
     )
