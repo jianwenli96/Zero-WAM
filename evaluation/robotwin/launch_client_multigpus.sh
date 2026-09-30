@@ -5,17 +5,18 @@ export LD_LIBRARY_PATH="/usr/lib64:/usr/lib:${LD_LIBRARY_PATH:-}"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ZERO_WAM_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd -P)
 
-: "${ROBOTWIN_ROOT:?Set ROBOTWIN_ROOT to the Robotwin checkout}"
+export ROBOTWIN_ROOT="${ROBOTWIN_ROOT:-/path/to/robotwin}"  # Set this to the root of the Robotwin repository
 
 SAVE_ROOT=${1:-${ZERO_WAM_ROOT}/results}
 SEED=${SEED:-0}
 TEST_NUM=${TEST_NUM:-100}
+HOST=${HOST:-127.0.0.1}
 START_PORT=${START_PORT:-29556}
 TARGET_TEXT_CFG=${TARGET_TEXT_CFG:--1}
 ICL_CFG=${ICL_CFG:-5}
 ICL_SEED=${ICL_SEED:-${SEED}}
 ICL_HUMAN_VIDEO_MAP=${ICL_HUMAN_VIDEO_MAP:-${SCRIPT_DIR}/robotwin_icl_human_videos.py}
-ICL_LATENT_ROOT=${ICL_LATENT_ROOT:-${ZERO_WAM_ROOT}/data/HumanGen/human_latents/robotwin}
+ICL_LATENT_ROOT=${ICL_LATENT_ROOT:-/path/to/data/HumanGen/human_latents/robotwin}
 LOG_ROOT=${LOG_ROOT:-${ZERO_WAM_ROOT}/logs}
 
 if [[ "${SAVE_ROOT}" != /* ]]; then
@@ -67,6 +68,7 @@ for i in "${!TASKS[@]}"; do
   PYTHONWARNINGS=ignore::UserWarning \
   python -m evaluation.robotwin.eval_policy_client_openpi \
     --config "${ROBOTWIN_ROOT}/policy/ACT/deploy_policy.yml" \
+    --host "${HOST}" \
     --port "${port}" \
     --save_root "${task_save_root}" \
     --video_guidance_scale "${TARGET_TEXT_CFG}" \

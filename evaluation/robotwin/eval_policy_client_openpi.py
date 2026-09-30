@@ -469,7 +469,8 @@ def main(usr_args):
     test_num = usr_args["test_num"]
 
     
-    model = WebsocketClientPolicy(port=usr_args['port'])
+    model = WebsocketClientPolicy(
+        host=usr_args.get('host', '127.0.0.1'), port=usr_args['port'])
 
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
@@ -761,6 +762,8 @@ def parse_args_and_config():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--overrides", nargs=argparse.REMAINDER)
+    parser.add_argument("--host", type=str, default="127.0.0.1",
+                        help="Remote policy server IP or hostname.")
     parser.add_argument("--port", type=int, default=8000, help='remote policy socket port.')
     parser.add_argument("--save_root", type=str, default="results/default_vis_path")
     parser.add_argument("--video_guidance_scale", type=float, default=-1.0)

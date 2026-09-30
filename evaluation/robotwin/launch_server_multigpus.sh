@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ZERO_WAM_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd -P)
 
-: "${MODEL_PATH:?Set MODEL_PATH to the released zero-wam-posttrain-robotwin model root}"
+: "${MODEL_PATH:?Set MODEL_PATH to the model root for this experiment}"
 
 START_PORT=${START_PORT:-29556}
 MASTER_PORT=${MASTER_PORT:-29661}
@@ -36,7 +36,7 @@ for i in {0..7}; do
   port=$((START_PORT + i))
   master_port=$((MASTER_PORT + i))
   log_file="${LOG_ROOT}/server_${i}_${BATCH_TIME}.log"
-  CUDA_VISIBLE_DEVICES=${i} \
+  ASCEND_RT_VISIBLE_DEVICES=${i} \
   TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_ROOT}/gpu_${i}" \
   python -m torch.distributed.run \
     --nproc_per_node 1 \
@@ -44,7 +44,7 @@ for i in {0..7}; do
     -m wan_va.wan_va_server \
     --config-name robotwin \
     --save_root "${SAVE_ROOT}" \
-    --port "${port}" > "${log_file}" 2>&1 &
+    --port "${port}" "$@" > "${log_file}" 2>&1 &
   SERVER_PIDS+=("$!")
   echo "$!" >> "${PID_FILE}"
 done
