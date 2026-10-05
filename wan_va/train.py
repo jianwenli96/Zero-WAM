@@ -992,7 +992,10 @@ class Trainer:
                 
                 self.step += 1
                 
-                if self.step % self.config.save_interval == 0:
+                if (
+                    self.step % self.config.save_interval == 0
+                    or self.step == self.config.num_steps
+                ):
                     if self.config.rank == 0:
                         logger.info(f"Starting save model at step {self.step}")
                     self.save_checkpoint()
