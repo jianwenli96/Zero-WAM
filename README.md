@@ -247,6 +247,84 @@ uses the empty-text embedding for the target robot stream. `SEED=0` fixes the
 Robotwin rollout seed. The ICL demonstration for each task is fixed by
 `evaluation/robotwin/robotwin_icl_human_videos.py`.
 
+### Separate inference and simulator machines
+
+HumanGen data is needed only on the inference server. Set
+`HUMANGEN_ROOT=/mnt/sfs_turbo/public/datasets/HumanGen` (or your data directory)
+when starting that server. The client sends a relative `icl_demo_id` selected
+from its demonstration map, without checking or reading local data files.
+The server resolves it beneath `human_latents/robotwin/`, preferring `.pth`
+latents, and falls back to `.mp4` under `human_data/robotwin/` if available.
+`ICL_LATENT_ROOT` and `ICL_VIDEO_ROOT` can override these directories on the
+server. The client no longer needs `ICL_LATENT_ROOT` or matching filesystem
+paths. Text-only inference skips demonstration lookup entirely.
+
+Restart the inference server after upgrading to this protocol before launching
+new clients. Updated servers also accept older clients' explicit path fields.
+The deprecated client `--icl_latent_root` option is accepted but ignored.
+
+`launch_server_multigpus_text_only.sh` starts seven policy servers on ports
+`29557–29563` (`START_PORT+1` through `START_PORT+7`). Start it in the server's
+inference environment with `MODEL_PATH` set to the text-only checkpoint root.
+The models must finish loading before the ports become available; check
+`evals/logs/ablation_text_only/server_*.log` if a process exits.
+
+For a server inside Docker or behind NAT, run this in a second terminal **in
+the same container/environment as the server** and leave it running:
+
+```bash
+GPU_SSH_HOST=ubuntu@your-gpu-host \
+bash evaluation/robotwin/launch_reverse_tunnel.sh
+```
+
+SSH prompts for authentication normally; no password is stored in the script.
+For background operation with automatic reconnection, first configure SSH key
+authentication, then run:
+
+```bash
+GPU_SSH_HOST=ubuntu@your-gpu-host \
+SSH_IDENTITY_FILE="$HOME/.ssh/zero_wam_gpu_tunnel" \
+bash evaluation/robotwin/launch_reverse_tunnel.sh start
+
+bash evaluation/robotwin/launch_reverse_tunnel.sh status
+bash evaluation/robotwin/launch_reverse_tunnel.sh stop
+```
+
+`start` detaches a supervisor from the terminal and logs to
+`evals/logs/tunnel/tunnel.log`. It uses noninteractive key authentication,
+detects unresponsive SSH connections with 15-second keepalives (three missed
+replies), and retries every five seconds after SSH exits. Override the retry
+delay with `RECONNECT_DELAY`. `status` reports supervisor liveness, not policy
+server readiness; use the client health check below to verify the full path.
+The default identity is `$HOME/.ssh/zero_wam_gpu_tunnel` if that file exists.
+The supervisor survives terminal closure and network outages, but must be
+started again after the container or machine restarts. Active evaluations may
+still fail when their WebSocket connection breaks; this does not resume a
+rollout automatically. Stop any earlier manually launched tunnel before
+starting the supervisor to avoid port conflicts.
+
+The tunnel binds seven loopback ports on the GPU machine and forwards them to
+the inference server. It needs outbound SSH from the server to the GPU machine,
+without inbound public policy ports or Docker port publishing. If those GPU
+ports are occupied, set `REMOTE_START_PORT` to a different base and use that
+base as `START_PORT` on the client.
+
+On the GPU machine, activate `robotwin`, enter this repository, and check:
+
+```bash
+conda activate robotwin
+HOST=127.0.0.1 CHECK_ONLY=1 SERVER_START_TIMEOUT=900 \
+bash evaluation/robotwin/launch_client_multigpus.sh
+```
+
+Then run the same command without `CHECK_ONLY=1` to evaluate. The launcher checks
+all seven `/healthz` endpoints before starting any simulators. `HOST=127.0.0.1`
+refers to the tunnel on the GPU machine. Keep a foreground tunnel terminal
+open, or use the background supervisor described above.
+For direct connections instead, set `HOST` to the server's reachable IP and
+ensure TCP ports `29557–29563` reach the container via firewall/NAT/Docker
+configuration. Successful ping alone does not verify this path.
+
 ### Eight-GPU Evaluation
 
 Run the full unseen-task evaluation:

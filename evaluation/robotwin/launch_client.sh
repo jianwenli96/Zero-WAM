@@ -12,7 +12,6 @@ task_name=${2:-stack_blocks_three}
 seed=${SEED:-0}
 PORT=${PORT:-29056}
 TEST_NUM=${TEST_NUM:-100}
-ICL_LATENT_ROOT=${ICL_LATENT_ROOT:-${ZERO_WAM_ROOT}/data/HumanGen/human_latents/robotwin}
 
 if [[ "${save_root}" != /* ]]; then
     save_root="${ZERO_WAM_ROOT}/${save_root#./}"
@@ -31,7 +30,6 @@ python -m evaluation.robotwin.eval_policy_client_openpi \
     --action_guidance_scale 1 \
     --icl_guidance_scale "${ICL_CFG:-5}" \
     --icl_human_video_map "${ICL_HUMAN_VIDEO_MAP:-${SCRIPT_DIR}/robotwin_icl_human_videos.py}" \
-    --icl_latent_root "${ICL_LATENT_ROOT}" \
     --icl_seed "${ICL_SEED:-${seed}}" \
     --test_num "${TEST_NUM}" \
     --overrides \

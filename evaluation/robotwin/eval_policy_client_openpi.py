@@ -1,3 +1,4 @@
+from evaluation.robotwin.icl_reference import demonstration_id
 import sys
 import os
 import subprocess
@@ -330,27 +331,6 @@ def select_icl_video(mapping, task_name, seed, episode_idx):
     return rng.choice(videos)
 
 
-def resolve_icl_latent_path(video_path, latent_root):
-    if not video_path or not latent_root:
-        return ""
-    video = Path(video_path)
-    root = Path(latent_root)
-    candidates = []
-
-    parts = video.parts
-    if "human_data" in parts:
-        relative_parts = parts[parts.index("human_data") + 1 :]
-        if relative_parts and relative_parts[0] == root.name:
-            relative_parts = relative_parts[1:]
-        candidates.append(root.joinpath(*relative_parts).with_suffix(".pth"))
-
-        mirrored_parts = list(parts)
-        mirrored_parts[mirrored_parts.index("human_data")] = "human_latents"
-        candidates.append(Path(*mirrored_parts).with_suffix(".pth"))
-
-    candidates.append(root / f"{video.stem}.pth")
-    return next((str(path) for path in candidates if path.exists()), "")
-
 
 def main(usr_args):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -369,7 +349,6 @@ def main(usr_args):
     icl_video_mapping = load_icl_human_video_map(
         usr_args["icl_human_video_map"]
     )
-    icl_latent_root = usr_args["icl_latent_root"]
     episode_offset = int(usr_args.get("episode_offset") or 0)
     instruction_type = 'seen'
     save_dir = None
@@ -385,7 +364,6 @@ def main(usr_args):
     args["save_root"] = save_root
     args["icl_seed"] = icl_seed
     args["icl_video_mapping"] = icl_video_mapping
-    args["icl_latent_root"] = icl_latent_root
     args["episode_offset"] = episode_offset
 
     embodiment_type = args.get("embodiment")
@@ -620,12 +598,10 @@ def eval_policy(task_name,
             args["icl_seed"],
             now_id,
         )
-        icl_latent_path = resolve_icl_latent_path(
-            icl_video_path, args["icl_latent_root"]
-        )
+        icl_demo_id = demonstration_id(icl_video_path)
         print(
             f"[ICL] task={task_name} episode={now_id} "
-            f"video={icl_video_path} latent={icl_latent_path or 'MP4_FALLBACK'}",
+            f"demo_id={icl_demo_id}",
             flush=True,
         )
         ret = model.infer(
@@ -634,8 +610,7 @@ def eval_policy(task_name,
                 prompt=prompt,
                 save_visualization=save_visualization,
                 use_icl=True,
-                icl_video_path=icl_video_path,
-                icl_latent_path=icl_latent_path,
+                icl_demo_id=icl_demo_id,
                 video_guidance_scale=video_guidance_scale,
                 icl_guidance_scale=icl_guidance_scale,
             )
@@ -774,7 +749,8 @@ def parse_args_and_config():
         type=str,
         default="evaluation/robotwin/robotwin_icl_human_videos.py",
     )
-    parser.add_argument("--icl_latent_root", type=str, required=True)
+    parser.add_argument("--icl_latent_root", type=str, default=None,
+                        help="Deprecated, ignored: configure ICL_LATENT_ROOT on the server.")
     parser.add_argument("--icl_seed", type=int, default=None)
     parser.add_argument("--start_seed", type=int, default=None)
     parser.add_argument("--episode_offset", type=int, default=0)

@@ -32,7 +32,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 cd "${ZERO_WAM_ROOT}"
-for i in {0..7}; do
+for i in {1..7}; do
   port=$((START_PORT + i))
   master_port=$((MASTER_PORT + i))
   log_file="${LOG_ROOT}/server_${i}_${BATCH_TIME}.log"
@@ -49,7 +49,8 @@ for i in {0..7}; do
   echo "$!" >> "${PID_FILE}"
 done
 
-echo "Robotwin servers started; PIDs: ${PID_FILE}"
+echo "Robotwin server processes launched (models may still be loading); PIDs: ${PID_FILE}"
+echo "Policy ports: $((START_PORT + 1))-$((START_PORT + 7)); logs: ${LOG_ROOT}/server_*_${BATCH_TIME}.log"
 set +e
 wait -n "${SERVER_PIDS[@]}"
 status=$?
@@ -58,4 +59,8 @@ if ((status == 0)); then
   status=1
 fi
 echo "A Robotwin server exited; stopping the remaining servers." >&2
+for log_file in "${LOG_ROOT}"/server_*_"${BATCH_TIME}".log; do
+  echo "Last lines of ${log_file}:" >&2
+  tail -n 15 "${log_file}" >&2
+done
 exit "${status}"

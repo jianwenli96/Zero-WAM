@@ -5,7 +5,7 @@ export LD_LIBRARY_PATH="/usr/lib64:/usr/lib:${LD_LIBRARY_PATH:-}"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ZERO_WAM_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd -P)
 
-export ROBOTWIN_ROOT="${ROBOTWIN_ROOT:-/path/to/robotwin}"  # Set this to the root of the Robotwin repository
+export ROBOTWIN_ROOT="${ROBOTWIN_ROOT:-/home/ubuntu/a-glj-ws/RoboTwin}"  # Set this to the root of the Robotwin repository
 
 SAVE_ROOT=${1:-${ZERO_WAM_ROOT}/results}
 SEED=${SEED:-0}
@@ -16,16 +16,31 @@ TARGET_TEXT_CFG=${TARGET_TEXT_CFG:--1}
 ICL_CFG=${ICL_CFG:-5}
 ICL_SEED=${ICL_SEED:-${SEED}}
 ICL_HUMAN_VIDEO_MAP=${ICL_HUMAN_VIDEO_MAP:-${SCRIPT_DIR}/robotwin_icl_human_videos.py}
-ICL_LATENT_ROOT=${ICL_LATENT_ROOT:-/path/to/data/HumanGen/human_latents/robotwin}
 LOG_ROOT=${LOG_ROOT:-${ZERO_WAM_ROOT}/evals/logs}
+SERVER_START_TIMEOUT=${SERVER_START_TIMEOUT:-30}
+
+echo "Checking policy servers at ${HOST}, ports $((START_PORT + 1))-$((START_PORT + 7))"
+python "${SCRIPT_DIR}/check_servers.py" --host "${HOST}" \
+  --start-port "${START_PORT}" --timeout "${SERVER_START_TIMEOUT}"
+# Diagnose connectivity without loading RoboTwin or starting an evaluation.
+if [[ "${CHECK_ONLY:-0}" == 1 ]]; then
+  exit 0
+fi
 
 if [[ "${SAVE_ROOT}" != /* ]]; then
   SAVE_ROOT="${ZERO_WAM_ROOT}/${SAVE_ROOT#./}"
 fi
 
-# Seven unique unseen tasks. Keep stack_blocks_three on GPU 0. The second
-# place_empty_cup process is an additional repeat and writes under a separate
-# root to avoid result races.
+# Seven concurrent simulations distributed over the two remote GPUs.
+GPU_DEVICES=${GPU_DEVICES:-0,1}
+if [[ ! "$GPU_DEVICES" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+  echo "GPU_DEVICES must be comma-separated device indices" >&2
+  exit 2
+fi
+IFS=',' read -r -a DEVICES <<< "$GPU_DEVICES"
+
+# Seven unique tasks match the seven servers on NPU devices 1..7.
+# START_PORT is the same base on both machines; ports are START_PORT+1..+7.
 TASKS=(
   stack_blocks_three
   place_object_scale
@@ -33,7 +48,6 @@ TASKS=(
   open_microwave
   move_stapler_pad
   place_bread_basket
-  place_empty_cup
   place_empty_cup
 )
 
@@ -58,13 +72,10 @@ trap 'exit 143' TERM
 cd "${ROBOTWIN_ROOT}"
 for i in "${!TASKS[@]}"; do
   task_name=${TASKS[$i]}
-  port=$((START_PORT + i))
+  port=$((START_PORT + i + 1))
   task_save_root=${SAVE_ROOT}
-  if [[ "${i}" == 7 ]]; then
-    task_save_root="${SAVE_ROOT}/place_empty_cup_repeat"
-  fi
   log_file="${LOG_ROOT}/client_${i}_${task_name}_${BATCH_TIME}.log"
-  CUDA_VISIBLE_DEVICES=${i} \
+  CUDA_VISIBLE_DEVICES=${DEVICES[$((i % ${#DEVICES[@]}))]} \
   PYTHONWARNINGS=ignore::UserWarning \
   python -m evaluation.robotwin.eval_policy_client_openpi \
     --config "${ROBOTWIN_ROOT}/policy/ACT/deploy_policy.yml" \
@@ -75,7 +86,6 @@ for i in "${!TASKS[@]}"; do
     --action_guidance_scale 1 \
     --icl_guidance_scale "${ICL_CFG}" \
     --icl_human_video_map "${ICL_HUMAN_VIDEO_MAP}" \
-    --icl_latent_root "${ICL_LATENT_ROOT}" \
     --icl_seed "${ICL_SEED}" \
     --test_num "${TEST_NUM}" \
     --overrides \

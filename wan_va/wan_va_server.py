@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+from evaluation.robotwin.icl_reference import resolve_icl_request
+
 import argparse
 from copy import deepcopy
 import os
@@ -1156,11 +1158,13 @@ class VA_Server:
 
         if self.use_icl_model:
             if reset:
+                icl_video_path, icl_latent_path = resolve_icl_request(
+                    obs, enabled=getattr(self.job_config, "enable_human_video", True))
                 self._reset(
                     prompt=prompt,
                     use_icl=bool(obs.get("use_icl", True)),
-                    icl_video_path=obs.get("icl_video_path", ""),
-                    icl_latent_path=obs.get("icl_latent_path", ""),
+                    icl_video_path=icl_video_path,
+                    icl_latent_path=icl_latent_path,
                     video_guidance_scale=getattr(
                         self.job_config, "target_text_cfg_override",
                         obs.get("video_guidance_scale", self.job_config.guidance_scale),
