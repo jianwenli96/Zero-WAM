@@ -17,7 +17,7 @@ ICL_CFG=${ICL_CFG:-5}
 ICL_SEED=${ICL_SEED:-${SEED}}
 ICL_HUMAN_VIDEO_MAP=${ICL_HUMAN_VIDEO_MAP:-${SCRIPT_DIR}/robotwin_icl_human_videos.py}
 ICL_LATENT_ROOT=${ICL_LATENT_ROOT:-/path/to/data/HumanGen/human_latents/robotwin}
-LOG_ROOT=${LOG_ROOT:-${ZERO_WAM_ROOT}/logs}
+LOG_ROOT=${LOG_ROOT:-${ZERO_WAM_ROOT}/evals/logs}
 
 if [[ "${SAVE_ROOT}" != /* ]]; then
   SAVE_ROOT="${ZERO_WAM_ROOT}/${SAVE_ROOT#./}"

@@ -1161,8 +1161,9 @@ class VA_Server:
                     use_icl=bool(obs.get("use_icl", True)),
                     icl_video_path=obs.get("icl_video_path", ""),
                     icl_latent_path=obs.get("icl_latent_path", ""),
-                    video_guidance_scale=obs.get(
-                        "video_guidance_scale", self.job_config.guidance_scale
+                    video_guidance_scale=getattr(
+                        self.job_config, "target_text_cfg_override",
+                        obs.get("video_guidance_scale", self.job_config.guidance_scale),
                     ),
                     icl_guidance_scale=obs.get(
                         "icl_guidance_scale", self.job_config.icl_guidance_scale
@@ -1251,6 +1252,9 @@ def run(args):
         getattr(config, 'enable_text', True),
         getattr(config, 'enable_mcp', True),
     )
+    if args.target_text_cfg is not None:
+        config.target_text_cfg_override = args.target_text_cfg
+        logger.info("Server target text CFG override: %s", args.target_text_cfg)
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
@@ -1295,6 +1299,8 @@ def main():
         default=None,
         help='save root'
     )
+    parser.add_argument('--target-text-cfg', type=float, default=None,
+                        help='Override client target text guidance on every ICL reset')
     parser.add_argument('--disable-human-video', action='store_true',
                         help='Disable human video and its cached text conditioning')
     parser.add_argument('--disable-text', action='store_true',

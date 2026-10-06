@@ -8,7 +8,7 @@ ZERO_WAM_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd -P)
 
 PORT=${PORT:-29056}
 MASTER_PORT=${MASTER_PORT:-29061}
-SAVE_ROOT=${SAVE_ROOT:-${ZERO_WAM_ROOT}/visualization}
+SAVE_ROOT=${SAVE_ROOT:-${ZERO_WAM_ROOT}/evals/visualization}
 
 export MODEL_PATH
 export PYTHONPATH="${ZERO_WAM_ROOT}:${PYTHONPATH:-}"
@@ -21,4 +21,4 @@ exec python -m torch.distributed.run \
     -m wan_va.wan_va_server \
     --config-name robotwin \
     --port "${PORT}" \
-    --save_root "${SAVE_ROOT}"
+    --save_root "${SAVE_ROOT}" "$@"

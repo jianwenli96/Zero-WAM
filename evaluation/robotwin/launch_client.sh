@@ -24,6 +24,7 @@ cd "${ROBOTWIN_ROOT}"
 exec env PYTHONWARNINGS=ignore::UserWarning XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 python -m evaluation.robotwin.eval_policy_client_openpi \
     --config "${ROBOTWIN_ROOT}/policy/ACT/deploy_policy.yml" \
+    --host "${HOST:-127.0.0.1}" \
     --port "${PORT}" \
     --save_root "${save_root}" \
     --video_guidance_scale "${TARGET_TEXT_CFG:--1}" \

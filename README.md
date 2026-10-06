@@ -279,7 +279,7 @@ all servers are healthy, and stops them after evaluation. The repeated
 `place_empty_cup` run is saved under `place_empty_cup_repeat` so it cannot
 overwrite the primary result.
 
-Each task uses the fixed human demonstration in `evaluation/robotwin/robotwin_icl_human_videos.py`. Human-video paths are relative to `data/HumanGen`, and precomputed latents are used when available. Logs are written to `./logs`, generated videos to `./visualization`, and rollout results to the selected `SAVE_ROOT`.
+Each task uses the fixed human demonstration in `evaluation/robotwin/robotwin_icl_human_videos.py`. Human-video paths are relative to `data/HumanGen`, and precomputed latents are used when available. Logs are written to `./evals/logs`, generated videos to `./evals/visualization`, and rollout results to the selected `SAVE_ROOT`.
 
 ## Training
 

@@ -63,7 +63,7 @@ export MODEL_PATH ROBOTWIN_ROOT ICL_LATENT_ROOT
 export PYTHONPATH="${ZERO_WAM_ROOT}:${PYTHONPATH:-}"
 cd "${ZERO_WAM_ROOT}"
 
-START_PORT="${START_PORT}" SAVE_ROOT="${ZERO_WAM_ROOT}/visualization" \
+START_PORT="${START_PORT}" SAVE_ROOT="${ZERO_WAM_ROOT}/evals/visualization" \
 bash evaluation/robotwin/launch_server_multigpus.sh &
 SERVER_LAUNCHER_PID=$!
 
