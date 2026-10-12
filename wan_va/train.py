@@ -217,6 +217,15 @@ class Trainer:
         self.wandb = _init_wandb(config)
         self.step = 0
         self.config = config
+        self.aloha_action_contract = None
+        for source in config.dataset_sources:
+            if source['name'] == 'aloha':
+                from .dataset.aloha import capture_action_contract
+                self.aloha_action_contract = capture_action_contract(
+                    Path(source['config'].dataset_path).parent)
+                if config.rank == 0:
+                    (Path(config.save_root) / 'aloha_action_contract.json').write_text(
+                        json.dumps(self.aloha_action_contract, indent=2))
         self.device = torch.device(f"cuda:{config.local_rank}")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
@@ -816,6 +825,10 @@ class Trainer:
             if self.config.rank == 0:
                 checkpoint_dir = self.save_dir / f"checkpoint_step_{self.step}"
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+                if self.aloha_action_contract is not None:
+                    (checkpoint_dir / 'aloha_action_contract.json').write_text(
+                        json.dumps(self.aloha_action_contract, indent=2))
 
                 # Save transformer in the same format as pretrained model
                 transformer_dir = checkpoint_dir / "transformer"

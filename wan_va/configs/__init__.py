@@ -12,7 +12,10 @@ from .va_oxe_train_cfg import va_oxe_train_cfg
 from .va_demo_cfg import va_demo_cfg
 from .va_demo_i2va import va_demo_i2va_cfg
 
+from .va_aloha_train_cfg import va_aloha_train_cfg
+
 VA_CONFIGS = {
+    'aloha_train': va_aloha_train_cfg,
     'robotwin': va_robotwin_cfg,
     'franka': va_franka_cfg,
     'robotwin_i2va': va_robotwin_i2va_cfg,
@@ -28,6 +31,7 @@ VA_CONFIGS = {
 }
 
 TRAIN_DATASET_CONFIGS = {
+    'aloha': va_aloha_train_cfg,
     'robotwin': va_robotwin_train_cfg,
     'agibot': va_agibot_train_cfg,
     'robocoin': va_robocoin_train_cfg,

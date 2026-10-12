@@ -124,11 +124,12 @@ class ICLAttentionBackend:
             video_to_icl_mask,
         )
 
+        # Use the actual tensor device: transfer_to_npu can accept a CUDA alias.
         cls.self_mask = cls._build_mask(
             mask_mod,
             len(query_type_ids),
             len(key_type_ids),
-            device=device,
+            device=query_type_ids.device,
             compile_mask=compile_mask,
         )
         return cls.self_mask
@@ -208,7 +209,7 @@ class ICLAttentionBackend:
             mask_mod,
             len(seq_ids),
             len(seq_ids),
-            device=device,
+            device=seq_ids.device,
             compile_mask=compile_mask,
         )
         return cls.self_mask
@@ -228,7 +229,7 @@ class ICLAttentionBackend:
             sequence_mask,
             len(query_seq_ids),
             len(encoder_seq_ids),
-            device=device,
+            device=query_seq_ids.device,
             compile_mask=compile_mask,
         )
         return cls.cross_mask
@@ -255,10 +256,14 @@ class ICLAttentionBackend:
         key = key.to(value.dtype)
 
         if isinstance(block_mask, torch.Tensor):
-            return F.scaled_dot_product_attention(
+            output = F.scaled_dot_product_attention(
                 query, key, value, attn_mask=block_mask,
                 dropout_p=0.0, is_causal=False,
-            ).transpose(1, 2)
+            )
+            # Ascend SDPA can return nonzero values for fully masked padding
+            # rows. Enforce the same zero-output/zero-gradient contract as CUDA.
+            output = output.masked_fill(~block_mask.any(dim=-1, keepdim=True), 0)
+            return output.transpose(1, 2)
 
         return _compiled_flex_attention(
             query,

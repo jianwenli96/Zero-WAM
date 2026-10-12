@@ -12,11 +12,19 @@ NGPU=${NGPU:-${MA_NUM_GPUS:-}}
 MASTER_PORT=${MASTER_PORT:-29501}
 
 PYTHON_BIN=${PYTHON_BIN:-/mnt/sfs_turbo/public/apps/miniforge3/envs/lingbot-vggt/bin/python}
-CONFIG_NAME=${CONFIG_NAME:-robotwin_train}
-DATASETS=${DATASETS:-robotwin:1.0,agibot:1.0,robocoin:1.0,robomind:1.0,interna1:1.0,oxe:1.0}
+CONFIG_NAME=${CONFIG_NAME:-aloha_train}
+if [[ "${CONFIG_NAME}" == "aloha_train" ]]; then
+    # 30% ALOHA; remaining 70% distributed equally across HumanGen collections.
+    DEFAULT_MODEL_PATH=/mnt/sfs_turbo/public/ckpts/Zero-WAM/zero-wam-pretrain
+    DATASETS=${DATASETS:-aloha:18,robotwin:7,agibot:7,robocoin:7,robomind:7,interna1:7,oxe:7}
+else
+    DEFAULT_MODEL_PATH=/mnt/sfs_turbo/public/ckpts/Zero-WAM/zero-wam-scratch
+    DATASETS=${DATASETS:-robotwin:1,agibot:1,robocoin:1,robomind:1,interna1:1,oxe:1}
+fi
+export ALOHA_PREPARED_ROOT=${ALOHA_PREPARED_ROOT:-/mnt/sfs_turbo/lijianwen/Datasets/aloha_zerowam_v3}
 
-export MODEL_PATH="${MODEL_PATH:-/mnt/sfs_turbo/public/ckpts/Zero-WAM/zero-wam-scratch}"
-export ZERO_WAM_SAVE_ROOT="${ZERO_WAM_SAVE_ROOT:-/mnt/sfs_turbo/lijianwen/Codes/Zero-WAM/outputs/robotwin_train_dist}"
+export MODEL_PATH="${MODEL_PATH:-${DEFAULT_MODEL_PATH}}"
+export ZERO_WAM_SAVE_ROOT="${ZERO_WAM_SAVE_ROOT:-/mnt/sfs_turbo/lijianwen/Codes/Zero-WAM/outputs/aloha_humangen_train_dist}"
 export HUMAN_GEN_ROOT="${HUMAN_GEN_ROOT:-/mnt/sfs_turbo/public/datasets/HumanGen}"
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -31,6 +39,10 @@ export ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/la
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 export HF_HOME="${HF_HOME:-/mnt/sfs_turbo/public/caches/huggingface}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+
+if [[ ",${DATASETS}," == *,aloha:* ]]; then
+    "${PYTHON_BIN}" script/check_aloha.py --root "${ALOHA_PREPARED_ROOT}" >&2
+fi
 
 exec "${PYTHON_BIN}" -m torch.distributed.run \
     --nnodes="${NNODES}" \

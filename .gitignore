@@ -31,3 +31,7 @@ data/
 
 .DS_Store
 .vscode/
+
+# Ascend compilation cache
+kernel_meta/
+fusion_result.json
