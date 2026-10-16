@@ -56,6 +56,22 @@ class VA_Server:
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
+        self.enable_rtc = bool(getattr(job_config, 'enable_rtc', False))
+        from .action_sampling import inference_action_stride
+        job_config.action_stride, self.sampling_contract_bound = inference_action_stride(
+            job_config.model_path, getattr(job_config, 'action_stride', None))
+        if job_config.action_stride > 1 and not self.enable_rtc:
+            raise ValueError('Joint time-stride inference requires the RTC client and native-rate feedback')
+        self._rtc_stream_position = None
+        self._rtc_guidance = None
+        self._rtc_session = None
+        if self.enable_rtc:
+            from .rtc.config import RTCConfig, RTCError
+            self.rtc_config = RTCConfig.from_job_config(job_config).validate()
+            if not getattr(job_config, 'use_icl_model', False) or job_config.world_size != 1:
+                raise RTCError('RTC currently requires the ICL model and one unsharded inference device')
+            if self.enable_offload:
+                raise RTCError('RTC requires enable_offload=False')
 
         self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
                                             sigma_min=0.0,
@@ -82,7 +98,7 @@ class VA_Server:
         self.text_encoder = load_text_encoder(
             resolve_model_component(model_root, 'text_encoder'),
             torch_dtype=self.dtype,
-            torch_device='cpu' if self.enable_offload else self.device,
+            torch_device='cpu' if self.enable_offload or self.enable_rtc else self.device,
         )
 
         empty_text_emb_path = getattr(job_config, "empty_text_emb_path", "")
@@ -106,7 +122,17 @@ class VA_Server:
             icl_model=self.use_icl_model,
         )
         shard_fn = shard_model
-        self.transformer = _configure_model(model=self.transformer,
+        if self.enable_rtc:
+            self.transformer.eval().requires_grad_(False).to(device=self.device, dtype=self.dtype)
+            # MCP is a training auxiliary; _forward_stream never calls it.
+            # Preserve its weights on CPU rather than consuming VJP workspace.
+            for name, module in self.transformer.named_children():
+                if name.startswith('mcp_'):
+                    module.to('cpu')
+            self.transformer.attn_window = int(getattr(job_config, 'rtc_attn_window', 4))
+            self.transformer.rtc_indexed_prune = True
+        else:
+            self.transformer = _configure_model(model=self.transformer,
                                             shard_fn=shard_fn,
                                             param_dtype=self.dtype,
                                             device=self.device,
@@ -584,6 +610,17 @@ class VA_Server:
         )
         logger.info(f"[ICL] persistent cache: {self.transformer.cache_counts()}")
 
+    def _encode_reset_prompt(self, **kwargs):
+        if not getattr(self, 'enable_rtc', False):
+            return self.encode_prompt(**kwargs)
+        # The text encoder is needed only during reset. Keep its computation
+        # on the same device, then release its device weights for KV/VJP memory.
+        self.text_encoder.to(self.device)
+        try:
+            return self.encode_prompt(**kwargs)
+        finally:
+            self.text_encoder.to('cpu')
+
     def _reset_icl(
         self,
         prompt,
@@ -596,6 +633,8 @@ class VA_Server:
         if not prompt:
             raise ValueError("Robotwin ICL inference requires a prompt")
         self.chunk_idx = 0
+        self._rtc_stream_position = None
+        self._rtc_guidance = None
         self.init_latent = None
         self.last_predicted_latents = None
         self.last_predicted_actions = None
@@ -626,7 +665,7 @@ class VA_Server:
         ).reshape(-1, 1, 1)
         self.action_norm_method = self.job_config.action_norm_method
 
-        self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
+        self.prompt_embeds, self.negative_prompt_embeds = self._encode_reset_prompt(
             prompt=prompt,
             negative_prompt="",
             do_classifier_free_guidance=True,
@@ -702,7 +741,9 @@ class VA_Server:
                 dtype=torch.int,
             )
         token_count = input_dict[grid_key].shape[1]
-        frame_id = 2 * self.chunk_idx + (1 if mode == "action" else 0)
+        position = getattr(self, '_rtc_stream_position', None)
+        phase = self.chunk_idx if position is None else position[1]
+        frame_id = 2 * phase + (1 if mode == "action" else 0)
         input_dict["current_frame_ids"] = torch.full(
             [token_count], frame_id, device=self.device, dtype=torch.int
         )
@@ -712,6 +753,7 @@ class VA_Server:
         return cfg_active
 
     def _prepare_icl_stream(self, data, timestep, mode, cache_type):
+        position = getattr(self, '_rtc_stream_position', None)
         grid_id = get_mesh_id(
             data.shape[-3],
             data.shape[-2]
@@ -720,7 +762,7 @@ class VA_Server:
             // (self.transformer.patch_size[2] if mode == "video" else 1),
             0 if mode == "video" else 1,
             1,
-            self.job_config.frame_chunk_size * self.chunk_idx,
+            self.job_config.frame_chunk_size * self.chunk_idx if position is None else position[0],
             action=False,
         ).to(self.device)
         stream_key = "latent_res_lst" if mode == "video" else "action_res_lst"
@@ -738,10 +780,14 @@ class VA_Server:
             grid_key: grid_id,
         }
         self._pack_icl_cfg(input_dict, mode, cache_type)
+        if position is not None:
+            input_dict['_rtc_static_key'] = (mode, tuple(data.shape), position, cache_type,
+                                             self.use_icl_cfg, self.target_text_cfg_active)
         return input_dict
 
     def _infer_icl(self, obs):
-        if self.chunk_idx == 0:
+        first = self.chunk_idx == 0 and getattr(self, '_rtc_stream_position', None) is None
+        if first:
             self.init_latent = self._encode_initial_obs(obs)
         latents = torch.randn(
             1,
@@ -782,12 +828,12 @@ class VA_Server:
         for step, timestep in enumerate(video_timesteps):
             last_step = step == len(video_timesteps) - 1
             latent_input = latents.clone()
-            if self.chunk_idx == 0:
+            if first:
                 latent_input[:, :, :1] = self.init_latent[:, :, :1]
             input_dict = self._prepare_icl_stream(
                 latent_input, timestep, "video", PREDICTION_CACHE_TYPE
             )
-            if self.chunk_idx == 0:
+            if first:
                 # CFG repeats the temporal axis as [cond frames, uncond
                 # frames].  The observed first frame is clean in every branch.
                 input_dict["latent_res_lst"]["timesteps"][
@@ -820,12 +866,25 @@ class VA_Server:
                 latents = self.scheduler.step(
                     noise, timestep, latents, return_dict=False
                 )
-                if self.chunk_idx == 0:
+                if first:
                     latents[:, :, :1] = self.init_latent[:, :, :1]
 
-        for timestep in self.action_scheduler.timesteps:
+        for action_step, timestep in enumerate(self.action_scheduler.timesteps):
             action_input = actions.clone()
             action_input[:, ~self.action_mask] = 0
+            guidance = getattr(self, '_rtc_guidance', None)
+            if guidance is not None:
+                from .rtc.guidance import guided_noise_velocity
+                def velocity_fn(value):
+                    prepared = self._prepare_icl_stream(value, timestep, 'action', PREDICTION_CACHE_TYPE)
+                    output = self.transformer(prepared, update_cache=0, cache_name=self.cache_name,
+                                              mode='forward_action_only')
+                    return rearrange(output, '1 (f n) c -> 1 c f n 1', f=self.job_config.frame_chunk_size)
+                action_noise = guided_noise_velocity(
+                    action_input, velocity_fn, self.action_scheduler.sigmas[action_step].item(),
+                    guidance['target'], guidance['weights'], guidance['beta'])
+                actions = self.action_scheduler.step(action_noise, timestep, actions, return_dict=False)
+                continue
             input_dict = self._prepare_icl_stream(
                 action_input, timestep, "action", PREDICTION_CACHE_TYPE
             )
@@ -844,8 +903,14 @@ class VA_Server:
                 action_noise, timestep, actions, return_dict=False
             )
         actions[:, ~self.action_mask] = 0
+        guidance = getattr(self, '_rtc_guidance', None)
+        if guidance is not None and guidance['delay']:
+            count = guidance['delay']
+            flat = actions.flatten(2)
+            flat[:, :, :count] = guidance['target'].flatten(2)[:, :, :count]
+            actions = flat.reshape_as(actions)
         cached_actions = actions.clone()
-        if self.chunk_idx == 0:
+        if first:
             cached_actions[:, :, 0] = 0
         self.last_predicted_latents = latents
         self.last_predicted_actions = cached_actions
@@ -1160,7 +1225,19 @@ class VA_Server:
                         "icl_guidance_scale", self.job_config.icl_guidance_scale
                     ),
                 )
+                if getattr(self, 'enable_rtc', False):
+                    from .rtc.server import RTCSession
+                    self._rtc_session = RTCSession(self, self.rtc_config)
+                    return dict(enable_rtc=True, rtc=self._rtc_session.metadata())
                 return dict()
+            if getattr(self, 'enable_rtc', False):
+                if compute_kv_cache:
+                    from .rtc.config import RTCError
+                    raise RTCError('RTC combines feedback and inference in one timestamped request')
+                if self._rtc_session is None:
+                    from .rtc.config import RTCError
+                    raise RTCError('Reset the RTC session before inference')
+                return self._rtc_session.infer(obs)
             if compute_kv_cache:
                 self._compute_icl_kv_cache(obs)
                 return dict()

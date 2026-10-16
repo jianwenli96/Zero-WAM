@@ -323,6 +323,14 @@ Checkpoints are written to `ZERO_WAM_SAVE_ROOT/checkpoints/checkpoint_step_N/tra
 
 > **Note:** The `zero-wam-posttrain-robotwin` checkpoint reported in the paper was post-trained on a mixture of Task-diverse VA data, the complete Pre-training ICL collection, and Robotwin ICL data using specified sampling ratios. The released training data contains only a subset of the Pre-training ICL collection and the Robotwin ICL data. Post-training with the released data will produce a model that differs from our released checkpoint.
 
+## ALOHA Real-Time Chunking
+
+ALOHA inference supports opt-in training-free RTC with `enable_rtc=False` by
+default. Launch `evaluation/aloha/launch_server.sh --enable-rtc` and use the
+RTC client to maintain a background action queue and measured latency buffer.
+Invalid timing budgets and missed deadlines raise errors. See
+[RTC setup, controller API and recorded-data replay](docs/rtc.md).
+
 ## Acknowledgments
 
 Zero-WAM is built on [Next Forcing](https://github.com/gangweix/next-forcing) and [LingBot-VA](https://github.com/Robbyant/lingbot-va). We thank the authors for releasing their work.

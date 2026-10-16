@@ -86,7 +86,44 @@ CONFIG_NAME=robotwin_train bash script/train_dist.sh
 短窗口训练、人类降采样以及原有按完整 30 槽位平均的 action loss 都可能影响效果；
 未修改所有集合的 loss 标度，避免引入未经验证的全局训练行为变更。
 
-## 开环推理验证
+## 延长动作时间跨度：action_stride
+
+`action_stride=1` 保持原行为。`--action-stride N` / `--action_stride N` 同时抽取
+机器人动作和已编码的视频latent，保留每latent的16个动作，使其覆盖原来的N倍时间。
+这会降低模型目标频率；机器人控制回调仍可保持30 Hz。
+
+```bash
+# ALOHA 30 Hz → 10 Hz目标；每latent仍是16个动作，覆盖1.6秒。
+bash script/train_dist.sh --action-stride 3
+```
+
+以N=3为例，读取原生latent后保留`z0,z3,z6,z9,z12,...`。z0配原有PAD块，
+z3配原生动作`a0,a3,...,a45`，z6配`a48,a51,...,a93`，依此类推。
+先沿整段时间轴抽样，再随机裁剪机器人训练窗口，clean/noisy历史、mask及MCP使用相同时间轴。
+动作/latent的结构和RoPE块内索引保持16个动作的布局。人类示范、文本和磁盘文件保持不变。
+
+| ALOHA配置 | 模型动作频率 | 每latent的16动作覆盖 | RTC F=4的64动作覆盖 | s=32重规划间隔 |
+|---|---:|---:|---:|---:|
+| stride=1 | 30 Hz | 0.533秒 | 2.133秒 | 1.067秒 |
+| stride=3 | 10 Hz | 1.6秒 | 6.4秒 | 3.2秒 |
+
+这里复用按原频率编码的VAE latent再抽样，**没有把RGB以更低fps重新送入VAE**，两者的
+时间感受野不同。在线RTC反馈先按原生观察频率编码，再保留同样的每第N个latent，与训练一致。
+源段33帧在stride=3后为11帧，若原生latent不足N+1帧，该段因没有完整未来间隔而排除，
+并报告排除数量。`max_train_frames`限制抽样后的帧数，不跨episode拼接、不外推缺失时间。
+
+现有混训入口将相同N应用于全部所选来源，各来源的模型动作频率是`原生动作频率/N`。
+相同N不会统一不同数据集的Hz，例如N=3时RoboTwin为50/3 Hz，ALOHA为10 Hz。
+快速接触、短时夹爪事件可能因降采样丢失，需用重训后的独立任务评测判断效果。
+
+参数记录于训练run的`action_sampling.json`、W&B配置及checkpoint的
+`transformer/config.json`中`_zero_wam_action_sampling`字段，契约版本为2。
+推理自动读取训练stride，显式传入冲突值会报错；stride>1只允许使用匹配的RTC客户端。
+客户端将模型目标插值到原生控制频率，四元数使用SLERP，夹爪保持前一个目标，详见[RTC](rtc.md)。
+曾采用`packed_native_grid`动作token抽稀的版本1、stride>1 checkpoint会被拒绝，必须重训。
+旧checkpoint没有此契约时默认stride=1；显式指定stride>1仅适合延迟探测，不能证明策略质量。
+
+## 开环推理验证（原生动作频率）
 
 使用生产 `VA_Server` 的真实视频条件、ICL cache、去噪和反归一化过程，ALOHA 服务明确返回
 `aloha_absolute_28_continuous_v2` 合约及统计量；客户端拒绝误连 Robotwin 服务或使用不一致统计量。

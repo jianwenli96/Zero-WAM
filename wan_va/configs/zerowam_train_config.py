@@ -29,6 +29,7 @@ zerowam_train_cfg.frame_chunk_size = 0
 zerowam_train_cfg.max_frame_chunk_size = 4
 zerowam_train_cfg.attn_window = 0
 zerowam_train_cfg.max_attn_window = 64
+zerowam_train_cfg.action_stride = 1  # Joint action/latent time stride; actions per latent unchanged.
 
 
 # Training efficiency

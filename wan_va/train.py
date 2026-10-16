@@ -61,6 +61,12 @@ from .dataset import (
     parse_dataset_mixture,
 )
 from .dataset.data_efficiency import crop_training_batch, training_sample_costs
+from .action_sampling import (
+    ACTION_SAMPLING_CONFIG_KEY,
+    action_sampling_metadata,
+    resample_training_batch,
+    validate_action_stride,
+)
 from .mcp import shift_latents_for_mcp, validate_mcp_settings
 from .utils.logging import add_file_logger
 import gc
@@ -111,6 +117,7 @@ def _build_dataset_sources(config, args, rank, local_rank, world_size):
         dataset_config.empty_emb_path = config.empty_emb_path
         dataset_config.init_worker = config.init_worker
         dataset_config.cfg_prob = config.droptext_target
+        dataset_config.action_stride = getattr(config, 'action_stride', 1)
         dataset_config.rank = rank
         dataset_config.local_rank = local_rank
         dataset_config.world_size = world_size
@@ -214,9 +221,15 @@ class Trainer:
         return str(transformer_path)
 
     def __init__(self, config):
+        validate_action_stride(getattr(config, 'action_stride', 1))
         self.wandb = _init_wandb(config)
         self.step = 0
         self.config = config
+        if config.rank == 0:
+            (Path(config.save_root) / 'action_sampling.json').write_text(
+                json.dumps(action_sampling_metadata(getattr(config, 'action_stride', 1)), indent=2)+'\n')
+            logger.info('Joint action/latent time stride=%d; actions per latent unchanged; native VAE encoding retained',
+                        getattr(config, 'action_stride', 1))
         self.aloha_action_contract = None
         for source in config.dataset_sources:
             if source['name'] == 'aloha':
@@ -395,6 +408,7 @@ class Trainer:
                     sample_costs = training_sample_costs(
                         train_dataset, getattr(config, 'max_train_frames', None),
                         self.patch_size,
+                        action_stride=getattr(config, 'action_stride', 1),
                     )
                     cost_tensor.copy_(torch.tensor(sample_costs, device=self.device))
                     logger.info('Built %d sample costs in %.2fs; bucket window=%d steps',
@@ -685,9 +699,10 @@ class Trainer:
             latent_loss * latent_loss_weight[:, None, :, None, None]
         )
 
+        action_batch_size, action_num_frames = input_dict['action_dict']['timesteps'].shape
         action_loss_weight = self.train_scheduler_action.training_weight(
             input_dict['action_dict']['timesteps'].flatten()
-        ).reshape(batch_size, num_frames)
+        ).reshape(action_batch_size, action_num_frames)
         if not bool(self.config.action_loss_reweight):
             action_loss_weight = torch.ones_like(action_loss_weight)
         action_loss = F.mse_loss(
@@ -739,6 +754,7 @@ class Trainer:
 
     def _train_step(self, batch, batch_idx):
         """Train a single batch, returns losses for logging."""
+        batch = resample_training_batch(batch, getattr(self.config, 'action_stride', 1))
         batch = crop_training_batch(
             batch, getattr(self.config, 'max_train_frames', None))
         window_crop = batch.get('_window_crop')
@@ -842,6 +858,8 @@ class Trainer:
                 config_file = transformer_dir / "config.json"
                 config_dict = dict(self.transformer.config)
                 config_dict.pop('_name_or_path', None)
+                config_dict[ACTION_SAMPLING_CONFIG_KEY] = action_sampling_metadata(
+                    getattr(self.config, 'action_stride', 1))
                 with open(config_file, 'w') as f:
                     json.dump(config_dict, f, indent=2)
 
@@ -1039,10 +1057,12 @@ def run(args):
         'save_root': args.save_root,
         'max_train_frames': getattr(args, 'max_train_frames', None),
         'length_bucket_steps': getattr(args, 'length_bucket_steps', None),
+        'action_stride': getattr(args, 'action_stride', None),
     }
     for key, value in overrides.items():
         if value is not None:
             config[key] = value
+    validate_action_stride(getattr(config, 'action_stride', 1))
     if getattr(config, 'max_train_frames', None) is not None and config.max_train_frames <= 0:
         raise ValueError('max_train_frames must be positive')
     config.cfg_prob = config.droptext_target
@@ -1159,6 +1179,9 @@ def main():
 
     parser.add_argument('--max-train-frames', type=int, default=None,
                         help='Optional aligned robot frame crop; full human ICL retained')
+    parser.add_argument('--action-stride', '--action_stride', type=int, default=None,
+                        help='Jointly subsample actions and video latents in time (default 1). '
+                             'Keeps actions per latent; each latent interval spans N times longer')
 
     args = parser.parse_args()
     run(args)

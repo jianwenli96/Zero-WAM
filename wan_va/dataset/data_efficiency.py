@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
 import torch
+from ..action_sampling import validate_action_stride
 
 
 class _MetadataOnly(pickle.Unpickler):
@@ -40,13 +41,15 @@ def _latent_shape(path):
     return shape
 
 
-def training_sample_costs(dataset, max_frames=None, patch_size=(1, 2, 2), workers=12):
+def training_sample_costs(dataset, max_frames=None, patch_size=(1, 2, 2), workers=12,
+                          action_stride=1):
     """Return costs in the flattened dataset's exact index order.
 
     Call on rank zero and broadcast once. No model tensors, Arrow action data,
     or video latent tensors are loaded. Avoid a stale disk cache: metadata is
     read anew for each invocation, then deduplicated within this invocation.
     """
+    action_stride = validate_action_stride(action_stride)
     _latent_shape.cache_clear()
     pf, ph, pw = patch_size
 
@@ -57,6 +60,7 @@ def training_sample_costs(dataset, max_frames=None, patch_size=(1, 2, 2), worker
         frames = robot_shapes[0][0]
         if any(s[0] != frames for s in robot_shapes):
             raise ValueError(f'Camera lengths disagree for {task.root}: {meta}')
+        frames = (frames - 1) // action_stride + 1
         frames = min(frames, max_frames) if max_frames else frames
         video_per_frame = sum((h // ph) * (w // pw) for _, h, w in robot_shapes)
         sample = task._lookup_icl_sample(meta)
@@ -65,7 +69,8 @@ def training_sample_costs(dataset, max_frames=None, patch_size=(1, 2, 2), worker
         action_per_frame = 16
         # Scheduling approximation; actual action layout varies by dataset.
         video = (frames // pf) * video_per_frame
-        return 2 * (video + frames * action_per_frame) + human
+        action_tokens = frames * action_per_frame
+        return 2 * (video + action_tokens) + human
 
     items = ((task, meta) for task in dataset._datasets for meta in task.new_metas)
     try:

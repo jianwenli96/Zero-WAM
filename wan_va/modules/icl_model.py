@@ -28,6 +28,7 @@ from torch.nn.attention.flex_attention import (
 )
 
 from .model import WanRotaryPosEmbed, WanTimeTextImageEmbedding
+from ..rtc.cache import memo
 
 
 _DENSE_MASK_DIRECT_ELEMENTS = 64 * 1024 * 1024
@@ -774,6 +775,23 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
     def _prune_cache(self, keep: torch.Tensor, cache_name: str = "pos") -> None:
         if self.type_ids_cache is None:
             return
+        if getattr(self, 'rtc_indexed_prune', False):
+            indices = torch.nonzero(keep, as_tuple=False).flatten()
+            if indices.numel() == keep.numel():
+                return
+            first = int(indices[0].item()) if indices.numel() else 0
+            last = int(indices[-1].item())+1 if indices.numel() else 0
+            contiguous = last-first == indices.numel()
+            for name in ('type_ids_cache', 'seq_ids_cache', 'frame_ids_cache', 'cache_type_ids_cache'):
+                value = getattr(self, name)
+                setattr(self, name, value[first:last] if contiguous else value.index_select(0, indices))
+            for block in self.blocks:
+                cache = block.attn1.attn_caches.get(cache_name)
+                if cache is not None:
+                    for name in ('k', 'v'):
+                        value = cache[name]
+                        cache[name] = value[:, first:last] if contiguous else value.index_select(1, indices)
+            return
         self.type_ids_cache = self.type_ids_cache[keep]
         self.seq_ids_cache = self.seq_ids_cache[keep]
         self.frame_ids_cache = self.frame_ids_cache[keep]
@@ -1257,7 +1275,10 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
             raise KeyError(f"Missing {grid_key}")
         if grid_id.ndim == 3:
             grid_id = grid_id[0]
-        rotary_emb = self.rope(grid_id[None])[:, :, None]
+        static_key = input_dict.get('_rtc_static_key')
+        def key(kind, *extra):
+            return (kind, static_key, *extra) if static_key is not None else None
+        rotary_emb = memo(key('rope'), lambda: self.rope(grid_id[None])[:, :, None])
 
         token_count = hidden_states.shape[1]
         device = hidden_states.device
@@ -1319,7 +1340,7 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
             if self.frame_ids_cache is None
             else torch.cat([self.frame_ids_cache, query_frame])
         )
-        self_mask = ICLAttentionBackend.build_self_mask(
+        self_mask = memo(key('self_mask', key_type.numel(), self.attn_window), lambda: ICLAttentionBackend.build_self_mask(
             query_type,
             key_type,
             query_seq,
@@ -1329,20 +1350,20 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
             self.attn_window,
             device,
             compile_mask=mode != "action",
-        )
+        ))
 
         text_emb = input_dict["text_emb"]
-        text_hidden_states = self.condition_embedder.text_embedder(text_emb)
+        text_hidden_states = memo(key('text'), lambda: self.condition_embedder.text_embedder(text_emb))
         encoder_seq = input_dict.get(
             "encoder_seq_ids",
             torch.zeros(text_hidden_states.shape[1], device=device, dtype=torch.int),
         ).to(device=device, dtype=torch.int)
-        cross_mask = ICLAttentionBackend.build_cross_mask(
+        cross_mask = memo(key('cross_mask', text_hidden_states.shape[1]), lambda: ICLAttentionBackend.build_cross_mask(
             query_seq,
             encoder_seq,
             device,
             compile_mask=mode != "action",
-        )
+        ))
         self._set_masks(self.blocks, self_mask, cross_mask)
 
         hs_latent = hidden_states if mode == "video" else None

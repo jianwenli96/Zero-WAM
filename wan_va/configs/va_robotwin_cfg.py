@@ -38,6 +38,7 @@ va_robotwin_cfg.empty_text_emb_path = os.environ.get(
     "EMPTY_TEXT_EMB_PATH", str(_default_empty_text_emb_path)
 )
 va_robotwin_cfg.use_icl_model = True
+va_robotwin_cfg.enable_rtc = False
 
 va_robotwin_cfg.attn_window = 64
 va_robotwin_cfg.frame_chunk_size = 2
