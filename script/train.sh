@@ -4,6 +4,8 @@ set -x
 
 umask 007
 
+zero_wam_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 NGPU=${NGPU:-"8"}
 PYTHON_BIN=${PYTHON_BIN:-"/mnt/sfs_turbo/public/apps/miniforge3/envs/lingbot-vggt/bin/python"}
 MASTER_PORT=${MASTER_PORT:-"29501"}
@@ -15,7 +17,7 @@ DATASETS=${DATASETS:-"robotwin:1.0,agibot:1.0"}
 
 # 将模型路径替换为实际位置
 export MODEL_PATH="${MODEL_PATH:-/mnt/sfs_turbo/public/ckpts/Zero-WAM/zero-wam-scratch}"
-export ZERO_WAM_SAVE_ROOT="${ZERO_WAM_SAVE_ROOT:-/mnt/sfs_turbo/lijianwen/Codes/Zero-WAM/outputs/robotwin_train}"
+export ZERO_WAM_SAVE_ROOT="${ZERO_WAM_SAVE_ROOT:-${zero_wam_repo_root}/outputs/robotwin_train}"
 export HUMAN_GEN_ROOT="${HUMAN_GEN_ROOT:-/mnt/sfs_turbo/public/datasets/HumanGen}"
 
 ## node setting
@@ -26,7 +28,7 @@ torchft_lighthouse=${TORCHFT_LIGHTHOUSE}
 config_name=${CONFIG_NAME}
 datasets=${DATASETS}
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "${zero_wam_repo_root}"
 export HF_HOME="${HF_HOME:-/mnt/sfs_turbo/public/caches/huggingface}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 

@@ -65,6 +65,7 @@ from .action_sampling import (
     ACTION_SAMPLING_CONFIG_KEY,
     action_sampling_metadata,
     resample_training_batch,
+    latent_stride_for,
     validate_action_stride,
 )
 from .mcp import shift_latents_for_mcp, validate_mcp_settings
@@ -118,6 +119,7 @@ def _build_dataset_sources(config, args, rank, local_rank, world_size):
         dataset_config.init_worker = config.init_worker
         dataset_config.cfg_prob = config.droptext_target
         dataset_config.action_stride = getattr(config, 'action_stride', 1)
+        dataset_config.actions_per_latent = getattr(config, 'actions_per_latent', None)
         dataset_config.rank = rank
         dataset_config.local_rank = local_rank
         dataset_config.world_size = world_size
@@ -227,9 +229,9 @@ class Trainer:
         self.config = config
         if config.rank == 0:
             (Path(config.save_root) / 'action_sampling.json').write_text(
-                json.dumps(action_sampling_metadata(getattr(config, 'action_stride', 1)), indent=2)+'\n')
-            logger.info('Joint action/latent time stride=%d; actions per latent unchanged; native VAE encoding retained',
-                        getattr(config, 'action_stride', 1))
+                json.dumps(action_sampling_metadata(getattr(config, 'action_stride', 1), getattr(config, 'actions_per_latent', None), getattr(config, 'action_per_frame', 16)), indent=2)+'\n')
+            logger.info('Action stride=%s, actions per latent=%s; native VAE encoding retained',
+                        getattr(config, 'action_stride', 1), getattr(config, 'actions_per_latent', None))
         self.aloha_action_contract = None
         for source in config.dataset_sources:
             if source['name'] == 'aloha':
@@ -409,6 +411,7 @@ class Trainer:
                         train_dataset, getattr(config, 'max_train_frames', None),
                         self.patch_size,
                         action_stride=getattr(config, 'action_stride', 1),
+                        actions_per_latent=getattr(config, 'actions_per_latent', None),
                     )
                     cost_tensor.copy_(torch.tensor(sample_costs, device=self.device))
                     logger.info('Built %d sample costs in %.2fs; bucket window=%d steps',
@@ -754,7 +757,12 @@ class Trainer:
 
     def _train_step(self, batch, batch_idx):
         """Train a single batch, returns losses for logging."""
-        batch = resample_training_batch(batch, getattr(self.config, 'action_stride', 1))
+        if (getattr(self.config, 'actions_per_latent', None) is not None
+                and batch['actions'].shape[3] != getattr(self.config, 'action_per_frame', 16)):
+            raise ValueError('actions_per_latent override requires native action blocks matching '
+                             'the training config action_per_frame; cannot save an inconsistent timebase')
+        batch = resample_training_batch(batch, getattr(self.config, 'action_stride', 1),
+                                        getattr(self.config, 'actions_per_latent', None))
         batch = crop_training_batch(
             batch, getattr(self.config, 'max_train_frames', None))
         window_crop = batch.get('_window_crop')
@@ -859,7 +867,8 @@ class Trainer:
                 config_dict = dict(self.transformer.config)
                 config_dict.pop('_name_or_path', None)
                 config_dict[ACTION_SAMPLING_CONFIG_KEY] = action_sampling_metadata(
-                    getattr(self.config, 'action_stride', 1))
+                    getattr(self.config, 'action_stride', 1), getattr(self.config, 'actions_per_latent', None),
+                    getattr(self.config, 'action_per_frame', 16))
                 with open(config_file, 'w') as f:
                     json.dump(config_dict, f, indent=2)
 
@@ -1058,11 +1067,13 @@ def run(args):
         'max_train_frames': getattr(args, 'max_train_frames', None),
         'length_bucket_steps': getattr(args, 'length_bucket_steps', None),
         'action_stride': getattr(args, 'action_stride', None),
+        'actions_per_latent': getattr(args, 'actions_per_latent', None),
     }
     for key, value in overrides.items():
         if value is not None:
             config[key] = value
-    validate_action_stride(getattr(config, 'action_stride', 1))
+    latent_stride_for(getattr(config, 'action_stride', 1), getattr(config, 'actions_per_latent', None),
+                      getattr(config, 'action_per_frame', 16))
     if getattr(config, 'max_train_frames', None) is not None and config.max_train_frames <= 0:
         raise ValueError('max_train_frames must be positive')
     config.cfg_prob = config.droptext_target
@@ -1182,6 +1193,10 @@ def main():
     parser.add_argument('--action-stride', '--action_stride', type=int, default=None,
                         help='Jointly subsample actions and video latents in time (default 1). '
                              'Keeps actions per latent; each latent interval spans N times longer')
+
+    parser.add_argument('--actions-per-latent', '--actions_per_latent', type=int, default=None,
+                        help='Override the number of action targets per video latent; e.g. 32 with stride 3. '
+                             'Video latent sampling is adjusted to preserve physical time alignment')
 
     args = parser.parse_args()
     run(args)

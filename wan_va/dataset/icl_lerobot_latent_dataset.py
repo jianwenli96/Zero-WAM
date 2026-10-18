@@ -192,7 +192,10 @@ class ICLLeRobotLatentDataset(LatentLeRobotDataset):
                 and self._human_latent_candidate(sample).is_file()
             )
         ]
-        stride = int(getattr(config, 'action_stride', 1))
+        from ..action_sampling import latent_stride_for
+        stride = latent_stride_for(int(getattr(config, 'action_stride', 1)),
+                                   getattr(config, 'actions_per_latent', None),
+                                   int(getattr(config, 'action_per_frame', 16)))
         self.short_time_stride_samples = 0
         if stride > 1:
             from .data_efficiency import _latent_shape
@@ -201,7 +204,7 @@ class ICLLeRobotLatentDataset(LatentLeRobotDataset):
             self.short_time_stride_samples = len(self.new_metas)-len(retained)
             self.new_metas = retained
             if self.short_time_stride_samples and getattr(config, 'rank', 0) == 0:
-                print(f'{self.root}: action_stride={stride} excludes '
+                print(f'{self.root}: latent_stride={stride} excludes '
                       f'{self.short_time_stride_samples} samples without a complete future interval', flush=True)
         if not self.new_metas:
             raise ValueError(f"No manifest-matched ICL samples found in {self.root}")

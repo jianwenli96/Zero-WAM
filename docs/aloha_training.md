@@ -64,6 +64,8 @@ bash script/train_dist.sh
 
 默认 `CONFIG_NAME=aloha_train`、`MODEL_PATH=/mnt/sfs_turbo/public/ckpts/Zero-WAM/zero-wam-pretrain`，
 不是 scratch 权重。保存到 `outputs/aloha_humangen_train_dist/<timestamp>`。
+默认输出目录根据脚本所在仓库自动定位，与启动时的工作目录无关；设置
+`ZERO_WAM_SAVE_ROOT` 可覆盖。`script/train.sh` 同样使用当前仓库下的 `outputs/robotwin_train`。
 默认单机 8 卡，也兼容原集群 `MA_NUM_HOSTS/VC_TASK_INDEX/VC_WORKER_HOSTS/MA_NUM_GPUS`，
 或显式 `NNODES/NODE_RANK/MASTER_ADDR/NGPU`；多节点仍需在每个节点执行脚本。
 
@@ -122,6 +124,29 @@ z3配原生动作`a0,a3,...,a45`，z6配`a48,a51,...,a93`，依此类推。
 客户端将模型目标插值到原生控制频率，四元数使用SLERP，夹爪保持前一个目标，详见[RTC](rtc.md)。
 曾采用`packed_native_grid`动作token抽稀的版本1、stride>1 checkpoint会被拒绝，必须重训。
 旧checkpoint没有此契约时默认stride=1；显式指定stride>1仅适合延迟探测，不能证明策略质量。
+
+## 每个视频 latent 对应32个动作目标
+
+`--actions-per-latent 32`（别名 `--actions_per_latent`）在训练时覆盖动作块长度；
+默认不覆盖，保留各来源原来的布局。ALOHA 使用原生16动作/latent时，配合
+`--action-stride 3` 得到10 Hz目标和每latent的32个动作，覆盖3.2秒。
+机器人latent相应保留`z0,z6,z12,...`，动作依次取`a0,a3,...,a93`、
+`a96,a99,...,a189`。初始PAD扩展为32个零动作，mask同步；人类示范不变。
+
+首次可只用ALOHA验证新时间布局：
+
+```bash
+DATASETS=aloha:1 bash script/train_dist.sh \
+  --action-stride 3 --actions-per-latent 32 --length-bucket-steps 0
+```
+
+单来源训练关闭长度分桶。混训时该覆盖应用到全部所选来源，输入的原生动作块长度必须
+与训练配置的`action_per_frame`一致；非整数latent跨度会报错，不会重解释成错误时间轴。
+原生动作频率仍按各来源决定，不保证全部为10 Hz。
+
+checkpoint保存版本3时间契约，包含原生/目标动作块长度和latent采样跨度。
+推理自动读取；与checkpoint冲突的动作块或stride参数会报错。旧模型显式覆盖32仅用于
+延迟探测，部署前需匹配后训练和任务评估。普通open-loop客户端仍只支持原生16动作布局。
 
 ## 开环推理验证（原生动作频率）
 

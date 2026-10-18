@@ -18,6 +18,8 @@ def parse_args(argv=None):
     p.add_argument('--chunk-frames', type=int, help='Default: 2; RTC: 16 native-rate or 4 for time-strided checkpoints')
     p.add_argument('--action-stride', '--action_stride', type=int, default=None,
                    help='Use checkpoint joint time stride; explicit override allowed only for legacy timing probes')
+    p.add_argument('--actions-per-latent', '--actions_per_latent', type=int, default=None,
+                   help='Action targets per video latent, e.g. 32; defaults to the checkpoint layout')
     p.add_argument('--enable-rtc', '--enable_rtc', action='store_true', default=False,
                    help='Enable training-free RTC; requires the RTC client protocol')
     p.add_argument('--rtc-control-hz', type=float, default=30)
@@ -34,14 +36,16 @@ def parse_args(argv=None):
     args.chunk_frames_explicit = args.chunk_frames is not None
     args.execution_horizon_explicit = args.rtc_execution_horizon is not None
     args.initial_latency_explicit = args.rtc_initial_latency is not None
-    coarse = args.action_stride is not None and args.action_stride > 1
+    coarse = (args.action_stride is not None and args.action_stride > 1) or args.actions_per_latent not in (None, 16)
     args.steps = args.steps if args.steps is not None else (1 if args.enable_rtc else 50)
     args.action_steps = args.action_steps if args.action_steps is not None else args.steps
     args.chunk_frames = args.chunk_frames if args.chunk_frames is not None else ((4 if coarse else 16) if args.enable_rtc else 2)
-    args.rtc_execution_horizon = args.rtc_execution_horizon if args.rtc_execution_horizon is not None else (32 if coarse else 128)
+    args.rtc_execution_horizon = args.rtc_execution_horizon if args.rtc_execution_horizon is not None else (2*(args.actions_per_latent or 16) if coarse else 128)
     args.rtc_initial_latency = args.rtc_initial_latency if args.rtc_initial_latency is not None else (2.0 if coarse else 3.342)
     if args.chunk_frames < 2 or min(args.steps, args.action_steps) < 1:
         p.error('Need chunk-frames >= 2 and positive video/action steps')
+    if args.actions_per_latent is not None and args.actions_per_latent < 1:
+        p.error('Need positive actions-per-latent')
     if args.enable_rtc and not 4 <= args.rtc_attn_window <= 64:
         p.error('RTC attention window must be between 4 and 64')
     return args
@@ -60,15 +64,19 @@ def main():
     cfg = deepcopy(va_aloha_train_cfg)
     cfg.norm_stat = model_quantiles(args.root / 'train/breakfast/meta/action_stats.json')
     cfg.model_path = str(args.model)
-    from wan_va.action_sampling import inference_action_stride
+    from wan_va.action_sampling import inference_action_stride, inference_actions_per_latent
     cfg.action_stride, cfg.sampling_contract_bound = inference_action_stride(args.model, args.action_stride)
-    if cfg.action_stride > 1:
+    cfg.native_action_per_frame = cfg.action_per_frame
+    cfg.action_per_frame, _ = inference_actions_per_latent(args.model, args.actions_per_latent,
+                                                         cfg.native_action_per_frame)
+    cfg.actions_per_latent = cfg.action_per_frame
+    if cfg.action_stride > 1 or cfg.action_per_frame != cfg.native_action_per_frame:
         if not args.enable_rtc:
             raise ValueError('Time-strided checkpoints require --enable-rtc for clock and feedback alignment')
         if not args.chunk_frames_explicit:
             args.chunk_frames = 4
         if not args.execution_horizon_explicit:
-            args.rtc_execution_horizon = 32
+            args.rtc_execution_horizon = 2*cfg.action_per_frame
         if not args.initial_latency_explicit:
             args.rtc_initial_latency = 2.0
         if not cfg.sampling_contract_bound:
@@ -109,6 +117,7 @@ def main():
                 result['inference_steps'] = self.job_config.num_inference_steps
                 result['action_inference_steps'] = self.job_config.action_num_inference_steps
                 result['action_stride'] = self.job_config.action_stride
+                result['actions_per_latent'] = self.job_config.action_per_frame
                 result['sampling_contract_bound'] = self.job_config.sampling_contract_bound
                 result['enable_rtc'] = self.enable_rtc
                 result['image_size'] = [self.height, self.width]

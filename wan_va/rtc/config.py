@@ -50,8 +50,8 @@ class RTCConfig:
                 raise RTCError(f'{name} must be finite and nonnegative')
         if self.control_hz == 0 or self.latency_multiplier < 1 or self.max_guidance_weight == 0:
             raise RTCError('Need control_hz>0, latency_multiplier>=1, max_guidance_weight>0')
-        if self.action_per_frame != 4*self.observation_stride:
-            raise RTCError('Causal VAE requires action_per_frame=4*observation_stride')
+        if self.action_per_frame*self.action_stride % (4*self.observation_stride):
+            raise RTCError('Causal VAE requires each action block to span whole native latent intervals')
         if self.horizon % self.action_per_frame or self.execution_horizon % self.action_per_frame:
             raise RTCError('RTC horizons must be whole latent intervals (multiples of action_per_frame)')
         self.check_delay(self.delay_steps(self.initial_latency), context='initial RTC budget')
@@ -72,6 +72,10 @@ class RTCConfig:
     @property
     def feedback_frames(self):
         return self.execution_horizon*self.action_stride//self.observation_stride
+
+    @property
+    def latent_stride(self):
+        return self.action_per_frame*self.action_stride//(4*self.observation_stride)
 
     def elapsed_delay_steps(self, latency):
         # Keep the anchor after the deadline frozen, so a queue swap cannot

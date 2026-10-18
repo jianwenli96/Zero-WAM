@@ -81,7 +81,7 @@ Zero-WAM achieves 46.95% average zero-shot success on seven unseen RoboTwin 2.0 
 
 ## Environment
 
-Use Python 3.10 with a CUDA-enabled PyTorch environment, then install the project dependencies:
+For CUDA/RoboTwin, use Python 3.10 with a CUDA-enabled PyTorch environment, then install the project dependencies. For Ascend/ALOHA and ModelArts, see [ALOHA post-training and RTC](#aloha-post-training-and-real-time-chunking).
 
 ```bash
 python -m pip install -r requirements.txt --no-build-isolation
@@ -302,7 +302,7 @@ DATASETS="robotwin:1.0" \
 bash script/train.sh --init-worker 1
 ```
 
-`robotwin:1.0` is the default, so `DATASETS` may be omitted for this mode.
+Keep `DATASETS="robotwin:1.0"` explicit for Robotwin-only training.
 The loader always excludes the seven unseen evaluation tasks and requires the
 remaining Robotwin training split to contain exactly 43 tasks. Training stops
 with an error if this isolation check fails.
@@ -319,17 +319,116 @@ bash script/train.sh --init-worker 1
 
 Each value in `DATASETS` is the relative probability of selecting that dataset for the next sample. The weights are normalized automatically; the equal weights above give each of the six sources probability `1/6`. Change the values to set another sampling mixture. After a source is selected, samples are drawn uniformly from that dataset.
 
-Checkpoints are written to `ZERO_WAM_SAVE_ROOT/checkpoints/checkpoint_step_N/transformer`. Run the repository tests with `python -m pytest -q`.
+Each run creates a timestamp directory. Checkpoints are written to `ZERO_WAM_SAVE_ROOT/<timestamp>/checkpoints/checkpoint_step_N/transformer`. Run the repository tests with `python -m pytest -q`.
 
 > **Note:** The `zero-wam-posttrain-robotwin` checkpoint reported in the paper was post-trained on a mixture of Task-diverse VA data, the complete Pre-training ICL collection, and Robotwin ICL data using specified sampling ratios. The released training data contains only a subset of the Pre-training ICL collection and the Robotwin ICL data. Post-training with the released data will produce a model that differs from our released checkpoint.
 
-## ALOHA Real-Time Chunking
+## ALOHA Post-training and Real-Time Chunking
 
-ALOHA inference supports opt-in training-free RTC with `enable_rtc=False` by
-default. Launch `evaluation/aloha/launch_server.sh --enable-rtc` and use the
-RTC client to maintain a background action queue and measured latency buffer.
-Invalid timing budgets and missed deadlines raise errors. See
-[RTC setup, controller API and recorded-data replay](docs/rtc.md).
+This branch supports prepared ALOHA data, joint video/action time resampling,
+configurable actions per video latent, and opt-in training-free real-time
+chunking (RTC). The Ascend path has been checked with Python 3.12, PyTorch 2.6,
+and `torch_npu` 2.6 on Ascend 910B3 devices with 64 GB HBM. Use a compatible CANN
+image and Python environment; the CUDA dependencies above are specific to that
+environment.
+
+| Guide | Contents |
+| --- | --- |
+| [ALOHA data and training](docs/aloha_training.md) | Data preparation, human-video pairing, action statistics, and post-training |
+| [RTC parameters and ModelArts (Chinese)](docs/aloha_rtc_parameters.md) | Parameter definitions, measured configurations, ModelArts mounts, and complete commands |
+| [RTC runtime](docs/rtc.md) | Timing checks, controller API, interpolation, and recorded-data replay |
+
+### Ascend and ModelArts Training
+
+Set the paths in the training container, or in the ModelArts job's environment
+settings. The prepared dataset includes the existing native-rate robot latents,
+human latents, pairing manifest, and action statistics. Model directories and
+all their symlink targets must be accessible on every node.
+
+```bash
+export PYTHON_BIN=/path/to/ascend-env/bin/python
+export ALOHA_PREPARED_ROOT=/path/to/aloha_zerowam_v3
+export MODEL_PATH=/path/to/initialization-model
+export ZERO_WAM_SAVE_ROOT=/path/to/writable/shared/aloha_rtc_output
+```
+
+From the repository root, first check ten training steps and checkpoint saving:
+
+```bash
+bash script/train_modelarts_rtc.sh --num-steps 10 --save-interval 10
+```
+
+Then start post-training:
+
+```bash
+bash script/train_modelarts_rtc.sh
+```
+
+The defaults are ALOHA-only training, `action_stride=3`,
+`actions_per_latent=32`, learning rate `1e-5`, batch size 1 per device,
+gradient accumulation 1, 5,000 steps, and a checkpoint every 2,500 steps.
+Training retains video, action, ICL, MCP, activation checkpointing, and FSDP.
+The output root can also contain the default HF/XDG caches; run logs and
+checkpoints are under its timestamp directories.
+
+For ModelArts, select a custom Bash startup command and run the same script
+once per node using its absolute mounted path. The launcher automatically reads
+node count, node rank, and master address from the platform. Every node uses
+all its visible NPUs by default: a visibility mask is measured through
+`torch_npu.npu.device_count()`; otherwise the launcher uses the platform's
+allocated card count or detects it at runtime. There is no fixed four- or
+eight-card fallback. `NGPU` remains an optional numeric override.
+
+For example, two nodes with eight visible NPUs each launch 16 workers. Nodes
+must have the same local worker count. All nodes need the same code version,
+shared data/model paths, and output root. Outside ModelArts, set `NNODES`,
+`NODE_RANK`, and `MASTER_ADDR` on each node; device count remains automatic.
+The default global batch size is the total number of training workers.
+Missing multi-node settings, invalid ranks, and zero visible devices fail
+before workers start. See the parameter guide for mount and environment details.
+
+### RTC Inference
+
+RTC defaults to disabled (`enable_rtc=False`). For the 32-action layout,
+post-train with the defaults above and point `MODEL_PATH` at a complete model
+root containing `transformer`, `vae`, `tokenizer`, `text_encoder`, and the saved
+ALOHA action contract. See the parameter guide for composing this directory
+from a training checkpoint.
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+export MODEL_PATH=/path/to/posttrained/complete-model
+NGPU=1 bash evaluation/aloha/launch_server.sh \
+  --enable-rtc --steps 3 --action-steps 10 \
+  --chunk-frames 4 --rtc-execution-horizon 64
+```
+
+The checkpoint records the training time layout; inference reads it
+automatically and rejects conflicting overrides. At ALOHA's native 30 Hz:
+
+| Setting | Value | Physical time |
+| --- | ---: | ---: |
+| Action stride | 3 | 10 Hz model targets, interpolated to 30 Hz control |
+| Actions per latent, A | 32 | 3.2 seconds per action block |
+| Future video latents, F | 4 | 128 future action targets, 12.8 seconds |
+| Receding amount, s | 64 | Start replanning every 6.4 seconds |
+| Video / action denoising steps | 3 / 10 | Configured at inference time |
+
+The native VAE encoding stays unchanged; training selects every sixth native
+robot latent to align with the longer action blocks. Use the RTC client to
+maintain the asynchronous action queue, run guided warmup, and track the
+maximum of a bounded latency history. RTC inference uses one unsharded device;
+training can use multiple nodes. Invalid budgets and missed deadlines raise
+errors, and the 32-action layout requires the RTC client.
+
+Recorded-data replay of this layout completed 85.3 seconds and 12 queue swaps
+with 3+10 denoising steps: mean latency 4.429 seconds, maximum 4.725 seconds,
+against a 5.208-second budget including the configured reserve. The timing
+probe used a legacy checkpoint; task quality needs matching post-training and
+robot evaluation. A separate four-NPU, ten-step training check completed real
+optimizer updates and checkpoint saving. Multi-node launch parameters have
+been tested; cross-node model training has not yet been measured.
 
 ## Acknowledgments
 

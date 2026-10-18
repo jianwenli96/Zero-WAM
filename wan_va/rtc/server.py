@@ -21,7 +21,7 @@ class RTCSession:
         self.failed = False
 
     def metadata(self):
-        return dict(self.config.as_dict(), protocol_version=2 if self.config.action_stride > 1 else 1,
+        return dict(self.config.as_dict(), protocol_version=2 if self.config.action_stride > 1 or self.config.action_per_frame != 4*self.config.observation_stride else 1,
                     session_id=self.session_id, full_future_horizon=True)
 
     def _actions(self, value, count, name):
@@ -94,11 +94,10 @@ class RTCSession:
                 # are supplied to guidance, never cached as observations.
                 m.transformer.clear_prediction_cache(-1, m.cache_name)
                 latent = m._encode_obs({'obs': images})
-                if cfg.action_stride > 1:
-                    expected_dense = cfg.execution_horizon*cfg.action_stride//cfg.action_per_frame
-                    if latent.shape[2] != expected_dense:
-                        raise RTCError('Native-rate feedback VAE output does not match the action timebase')
-                    latent = latent[:, :, cfg.action_stride-1::cfg.action_stride].contiguous()
+                expected_dense = cfg.execution_horizon*cfg.action_stride//(4*cfg.observation_stride)
+                if latent.shape[2] != expected_dense:
+                    raise RTCError('Native-rate feedback VAE output does not match the action timebase')
+                latent = latent[:, :, cfg.latent_stride-1::cfg.latent_stride].contiguous()
                 if latent.shape[2] != cfg.execution_horizon//cfg.action_per_frame:
                     raise RTCError('Feedback VAE output does not align with executed action intervals')
                 m._rtc_stream_position = (self.action_start//cfg.action_per_frame+1, self.phase)

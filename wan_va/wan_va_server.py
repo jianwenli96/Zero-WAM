@@ -57,10 +57,13 @@ class VA_Server:
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
         self.enable_rtc = bool(getattr(job_config, 'enable_rtc', False))
-        from .action_sampling import inference_action_stride
+        from .action_sampling import inference_action_stride, inference_actions_per_latent
         job_config.action_stride, self.sampling_contract_bound = inference_action_stride(
             job_config.model_path, getattr(job_config, 'action_stride', None))
-        if job_config.action_stride > 1 and not self.enable_rtc:
+        native_a = getattr(job_config, 'native_action_per_frame', job_config.action_per_frame)
+        job_config.action_per_frame, _ = inference_actions_per_latent(
+            job_config.model_path, getattr(job_config, 'actions_per_latent', None), native_a)
+        if (job_config.action_stride > 1 or job_config.action_per_frame != native_a) and not self.enable_rtc:
             raise ValueError('Joint time-stride inference requires the RTC client and native-rate feedback')
         self._rtc_stream_position = None
         self._rtc_guidance = None

@@ -49,11 +49,12 @@ records the joint action/latent time stride. Inference reads it automatically:
 NGPU=1 bash evaluation/aloha/launch_server.sh --enable-rtc --steps 2
 ```
 
-For a stride>1 checkpoint the defaults become F=4, H=64 model actions, s=32
-model actions and seed latency=2 seconds; explicit flags override these values.
+For a stride>1 checkpoint the defaults become F=4, H=4×A model actions, s=2×A
+model actions and seed latency=2 seconds, where A is the saved actions per latent
+(16 by default, or a post-trained override such as 32). Explicit flags override these values.
 `--steps` controls both video and action denoising; `--action-steps` can override
 the action branch independently (e.g. `--steps 4 --action-steps 2` means 4+2).
-Calibrate on the target device. At 30 Hz native control with stride=3 the model target rate is 10 Hz,
+Calibrate on the target device. With A=16, at 30 Hz native control with stride=3 the model target rate is 10 Hz,
 the prediction covers 6.4 seconds, and replanning occurs every 3.2 seconds.
 The prefix and initial z0/PAD are still prefilled separately, so F counts future
 latent frames. This keeps the generated F within the training maximum of four.
@@ -73,6 +74,41 @@ which two are retained. The native controller runs at 30 Hz and interpolates
 the 10 Hz anchors: linear positions/joints, normalized quaternion SLERP, and
 left-held grippers. Model actions and protocol timestamps use coarse action
 units; the controller tracks native ticks separately.
+
+### 32 actions per latent at 10 Hz
+
+`--actions-per-latent 32` increases the number of action targets paired with each
+video latent. With ALOHA `action_stride=3`, each latent spans 3.2 seconds: training
+retains native z0,z6,z12,... and groups 32 actions spaced three native ticks apart.
+Feedback encodes all native RGB first, then retains every sixth native latent.
+The native VAE encoding is unchanged. A 64-target executed prefix supplies 48
+RGB observation groups and commits two retained video latents.
+
+| Layout at 30 Hz native control | Model target rate | F=4 future targets | Prediction span | Half-horizon replanning |
+|---|---:|---:|---:|---:|
+| A=16, stride=3 | 10 Hz | 64 | 6.4s | s=32, 3.2s |
+| A=32, stride=3 | 10 Hz | 128 | 12.8s | s=64, 6.4s |
+
+Each denoising iteration processes all F×A targets jointly. A=32 changes the
+temporal training layout and doubles the action tokens; it does not add serial
+denoising rounds. Weights have compatible shapes, but task quality still needs
+post-training and evaluation with the new action/latent pairing.
+
+```bash
+# After post-training with --action-stride 3 --actions-per-latent 32,
+# MODEL_PATH points to the composed model root. Layout is read automatically.
+NGPU=1 bash evaluation/aloha/launch_server.sh \
+  --enable-rtc --steps 3 --action-steps 10 --chunk-frames 4
+```
+
+The automatic execution horizon is 2×A, thus 64 for this layout. Explicit
+`--rtc-execution-horizon` is preserved. To reproduce timing with a legacy model,
+also pass `--action-stride 3 --actions-per-latent 32`; metadata marks this as an
+unbound timing probe. Version-2 checkpoints without a saved block override keep
+their original block size and cannot be silently overridden.
+
+With H=128, s=64 and a 10 Hz target rate, the unchanged 20%+50ms reserve plus one
+interpolation anchor permits raw latency up to approximately 5.208 seconds.
 
 ## Timing checks and latency buffer
 
