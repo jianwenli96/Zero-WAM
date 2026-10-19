@@ -342,3 +342,132 @@ If you find Zero-WAM useful, please cite:
   url = {https://arxiv.org/abs/2608.26103}
 }
 ```
+
+## PiperPika joint-only post-training (64 devices)
+
+`script/train_dist.sh` now defaults to `piperpika_train`. Its source is
+`/mnt/sfs_turbo/lijianwen/Datasets/piperpika_10_16`, explicitly using
+`lerobot28_v21_h264_crf18_20261017_160250` and `human_robot_alignment.json`.
+The older MPEG-4 directory is never selected as a fallback. Original recordings
+are read-only; prepared metadata and latents live in the sibling directory
+`piperpika_10_16_zerowam_joint_v2` (`PIPERPIKA_PREPARED_ROOT` overrides it).
+
+The 60 aligned human/robot groups describe different object/container combinations
+of one task, each with two robot repetitions. Seed 42 holds out 6 entire groups
+(12 episodes, 14 windows); training uses 54 groups (108 episodes, 132 windows).
+Both repetitions and their human demonstration stay in the same split. This is
+combination-level evaluation, not evidence of cross-task generalization. Repeated
+semantic combinations across groups require additional labels for a stricter split.
+
+Only the new robot data's 12 absolute joints and 2 grippers are supervised.
+Source columns 14:26 map to pretrained model slots 14:26, and source columns
+26:28 map to slots 28:30. EEF slots 0:14 and padding slots 26:28 contain zero clean
+action and have false loss masks. The model remains 30-dimensional for checkpoint
+compatibility; invalid slots may contain sampled diffusion noise during training,
+matching the existing training convention. HumanGen retains its original per-source
+action representation and supervision as replay. Statistics use training episodes
+only; no EEF quaternion conversion is needed for this joint-only path.
+
+Defaults: 20% PiperPika plus 16% each AgiBot/RoboCOIN/RoboMIND/InternData-A1/OXE,
+no RoboTwin; full Transformer update with peak LR 2e-6, 100-step warmup, cosine
+decay to 10%, 3000 steps, batch 1/device, accumulation 1, checkpoint every 500 steps.
+At 64 devices, that is approximately 38,400 real windows (~291 draws per training
+window), not 3000 epochs. Video/action/MCP objectives, ICL dropout, and the training
+noise grid are preserved. These are conservative starting values, not a guarantee
+of retained generalization. `effective_config.json` records resolved settings.
+
+On a cluster providing `MA_NUM_HOSTS`, `MA_NUM_GPUS`, `VC_TASK_INDEX`, and
+`VC_WORKER_HOSTS`, run on every node:
+
+```bash
+bash script/train_dist.sh
+```
+
+Otherwise, for **8 nodes × 8 devices**, set `NNODES=8`, `NGPU=8`, `MASTER_ADDR`
+to the rank-0 node address, and `NODE_RANK=0..7` separately on each node. `NGPU` is
+per-node, not the total 64. The launcher first uses torchrun to prepare metadata on
+global rank 0, encode disjoint latent jobs on all devices, and validate every real
+dataset sample before starting training. The preparation rendezvous uses
+`MASTER_PORT+1` (override with `PREPARE_MASTER_PORT`). `DEVICE_TYPE` defaults to
+`npu`; set `DEVICE_TYPE=cuda` for CUDA encoding. All nodes must share the paths.
+
+Preparation resumes committed latent files and rejects changed source/model files.
+To prepare metadata without encoding, run `python script/prepare_piperpika.py prepare`.
+After all 498 artifacts have been encoded and checked, `PREPARE_DATA=0` skips the
+distributed encoding phase but still validates provenance. It does not skip missing
+latents. Training checkpoints still contain model weights rather than complete
+optimizer/sampler state; restarting weights is not exact training resume.
+
+For a RoboTwin ablation at the same real-data fraction, use
+`DATASETS='piperpika:5,robotwin:2,agibot:3.6,robocoin:3.6,robomind:3.6,interna1:3.6,oxe:3.6'`.
+Removing simulation is a domain-mixture hypothesis, not an established improvement.
+Compare held-out real combinations and fixed original-domain evaluations. Select
+checkpoints by these evaluations, not by the lowest mixed training loss. Also
+compare correct/no/wrong-human prompts at identical noise seeds and measure grasp,
+release, and closed-loop task success; short-horizon average action MAE is insufficient.
+
+A separate inference entrypoint returns 14 channels in this order:
+`left_joint_0..5, right_joint_0..5, left_gripper, right_gripper` (original units).
+Do not connect a client expecting the previous 28D ALOHA or 16D RoboTwin contract.
+As with existing deployment, assemble a model root with the checkpoint's
+`transformer` and base model's `vae`, `tokenizer`, `text_encoder`; keep
+`piperpika_action_contract.json` beside the checkpoint (or copy it to the model root).
+The new server validates that contract against the preparation statistics:
+
+```bash
+MODEL_PATH=/path/to/assembled/model bash evaluation/piperpika/launch_server.sh --steps 20
+```
+
+`--steps` sets both video and action denoising steps. Compare 50/30/20/10 steps at
+fixed checkpoints and seeds, recording latency and success. Training still uses
+1000 noise levels; do not reduce that grid to the inference step count. Very low
+step counts may require separately validated distillation, which is not implemented
+here. The server defaults to 20 steps as an evaluation starting point, not a claim
+of equivalent quality. Human demonstrations should use the prepared `.pth` files
+to preserve encoding/subsampling consistency.
+
+With the PiperPika server running, an offline client evaluates held-out windows
+without connecting to the robot and reports joint/gripper MAE and request latency:
+
+```bash
+python -m evaluation.piperpika.open_loop --max-windows 14 --output outputs/piperpika_eval_20
+python -m evaluation.piperpika.open_loop --max-windows 14 --no-icl --output outputs/piperpika_eval_20_no_icl
+```
+
+Restart the server with `--steps 50`, `30`, or `10` and use distinct output paths
+for the same-seed denoising comparison. Latency includes the observation request and
+response; reset/ICL-cache construction is outside that timing. These are independent
+initial-image predictions, not closed-loop rollout or a guarantee of control rate.
+
+The revised split uses `joint_v2`; the earlier `joint_v1` directory is preserved.
+Its checkpoint statistics must not be mixed with v2 statistics. Training chunk size
+is sampled independently per microbatch/rank from 1–4 **latent frames**, while each
+robot sample contains 2–33 latent frames. It does not truncate the sample to a single
+chunk. Each noninitial latent frame corresponds to 16 original 30-Hz actions;
+the initial frame has a dummy zero action block. A maximum 129 sampled RGB frames
+(stride 4, 7.5 Hz) span 512 control intervals and encode to 33 latent frames.
+Human videos use full-duration uniform sampling capped at 129 frames, so long demos
+have an effective rate below 12 Hz; this is semantic conditioning, not synchronized
+human/robot timing.
+
+Independent numerical audit (including nonzero window starts):
+
+```bash
+python script/audit_piperpika.py --output outputs/piperpika_joint_v2_audit.json
+```
+
+This recomputes training-only statistics, tests per-window action values and inverse
+normalization, checks camera sampling indices and available encoded robot shapes.
+It does not prove physical camera/control timestamp calibration. The inherited
+loss averages over all 30 action slots (only 14 active here) and also supervises
+the initial dummy block; these pretrained conventions are retained. Invalid slots
+have diffusion noise during training but are zeroed at inference. Neither convention
+is a guarantee of optimal joint-only control and both require controlled ablations
+before changing the shared replay objective.
+
+The v2 audit found 8/132 training windows with only 2–4 latent frames (short tails);
+far-future MCP branches have few or no valid targets there. They remain included
+to preserve end-of-task actions; the existing valid masks prevent supervising
+out-of-range targets. Current 60 human demos last 4.0–8.1 seconds, so none hits
+the 129-frame cap. The long-demo subsampling limitation above is not active for
+this collection.

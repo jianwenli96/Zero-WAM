@@ -217,6 +217,7 @@ class Trainer:
         self.wandb = _init_wandb(config)
         self.step = 0
         self.config = config
+        self.piperpika_action_contract = None
         self.aloha_action_contract = None
         for source in config.dataset_sources:
             if source['name'] == 'aloha':
@@ -226,6 +227,13 @@ class Trainer:
                 if config.rank == 0:
                     (Path(config.save_root) / 'aloha_action_contract.json').write_text(
                         json.dumps(self.aloha_action_contract, indent=2))
+        for source in config.dataset_sources:
+            if source['name'] == 'piperpika':
+                from .dataset.piperpika import capture_action_contract
+                self.piperpika_action_contract = capture_action_contract(Path(source['config'].dataset_path).parent)
+                if config.rank == 0:
+                    (Path(config.save_root) / 'piperpika_action_contract.json').write_text(
+                        json.dumps(self.piperpika_action_contract, indent=2))
         self.device = torch.device(f"cuda:{config.local_rank}")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
@@ -306,8 +314,16 @@ class Trainer:
             foreach=False,
         )
 
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, 
-            lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
+        if getattr(config, 'lr_schedule', 'constant') == 'cosine':
+            from .utils.finetune import cosine_warmup_ratio
+            # Short smoke runs may override num_steps below the configured warmup.
+            warmup = min(config.warmup_steps, max(0, config.num_steps - 1))
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer, lr_lambda=lambda step: cosine_warmup_ratio(
+                    step, warmup, config.num_steps, config.min_lr_ratio))
+        else:
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer,
+                lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
 
         # Setup dataloaders
         logger.info("Setting up datasets...")
@@ -826,6 +842,9 @@ class Trainer:
                 checkpoint_dir = self.save_dir / f"checkpoint_step_{self.step}"
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+                if self.piperpika_action_contract is not None:
+                    (checkpoint_dir / 'piperpika_action_contract.json').write_text(
+                        json.dumps(self.piperpika_action_contract, indent=2))
                 if self.aloha_action_contract is not None:
                     (checkpoint_dir / 'aloha_action_contract.json').write_text(
                         json.dumps(self.aloha_action_contract, indent=2))
@@ -1076,6 +1095,12 @@ def run(args):
             logger.info(f"Using config: {args.config_name}")
             logger.info(f"Using DATASETS: {args.datasets}")
             logger.info(f'Training output directory: {config.save_root}')
+            (Path(config.save_root) / 'effective_config.json').write_text(
+                json.dumps(dict(config), indent=2, default=str))
+            logger.info('Effective training: lr=%s schedule=%s warmup=%s global_batch=%s steps=%s model=%s',
+                        config.learning_rate, getattr(config, 'lr_schedule', 'constant'), config.warmup_steps,
+                        world_size * config.batch_size * config.gradient_accumulation_steps,
+                        config.num_steps, config.model_path)
         trainer = Trainer(config)
         trainer.train()
     except Exception:
