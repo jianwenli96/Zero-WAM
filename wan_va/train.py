@@ -67,6 +67,8 @@ from .action_sampling import (
     resample_training_batch,
     latent_stride_for,
     validate_action_stride,
+    sampling_datasets,
+    sampling_for_dataset,
 )
 from .mcp import shift_latents_for_mcp, validate_mcp_settings
 from .utils.logging import add_file_logger
@@ -91,6 +93,9 @@ def _build_dataset_sources(config, args, rank, local_rank, world_size):
         available_names=TRAIN_DATASET_CONFIGS,
     )
     bucket_steps = getattr(config, 'length_bucket_steps', 0)
+    sampling_names = sampling_datasets(getattr(config, 'action_sampling_datasets', None))
+    if sampling_names is not None and not set(sampling_names) <= {name for name, _ in entries}:
+        raise ValueError('action_sampling_datasets must name sources selected by DATASETS')
     if bucket_steps < 0 or (bucket_steps and len(entries) == 1):
         raise ValueError('Length bucketing requires nonnegative steps and a weighted dataset mixture')
     path_overrides = {
@@ -113,13 +118,13 @@ def _build_dataset_sources(config, args, rank, local_rank, world_size):
         if len(entries) == 1:
             dataset_config.update(path_overrides)
 
-        # These settings are shared by every selected data source, while camera,
-        # action, latent, and manifest settings remain dataset-specific.
+        # Share dropout/loading settings; time-layout changes may be scoped to
+        # the deployment robot while replay sources keep their native layout.
         dataset_config.empty_emb_path = config.empty_emb_path
         dataset_config.init_worker = config.init_worker
         dataset_config.cfg_prob = config.droptext_target
-        dataset_config.action_stride = getattr(config, 'action_stride', 1)
-        dataset_config.actions_per_latent = getattr(config, 'actions_per_latent', None)
+        dataset_config.action_stride, dataset_config.actions_per_latent = sampling_for_dataset(config, name)
+        dataset_config.training_dataset_name = name
         dataset_config.rank = rank
         dataset_config.local_rank = local_rank
         dataset_config.world_size = world_size
@@ -229,9 +234,11 @@ class Trainer:
         self.config = config
         if config.rank == 0:
             (Path(config.save_root) / 'action_sampling.json').write_text(
-                json.dumps(action_sampling_metadata(getattr(config, 'action_stride', 1), getattr(config, 'actions_per_latent', None), getattr(config, 'action_per_frame', 16)), indent=2)+'\n')
+                json.dumps(action_sampling_metadata(getattr(config, 'action_stride', 1), getattr(config, 'actions_per_latent', None), getattr(config, 'action_per_frame', 16),
+                                                   datasets=getattr(config, 'action_sampling_datasets', None)), indent=2)+'\n')
             logger.info('Action stride=%s, actions per latent=%s; native VAE encoding retained',
                         getattr(config, 'action_stride', 1), getattr(config, 'actions_per_latent', None))
+        self.piperpika_action_contract = None
         self.aloha_action_contract = None
         for source in config.dataset_sources:
             if source['name'] == 'aloha':
@@ -241,6 +248,14 @@ class Trainer:
                 if config.rank == 0:
                     (Path(config.save_root) / 'aloha_action_contract.json').write_text(
                         json.dumps(self.aloha_action_contract, indent=2))
+        for source in config.dataset_sources:
+            if source['name'] == 'piperpika':
+                from .dataset.piperpika import capture_action_contract
+                self.piperpika_action_contract = capture_action_contract(
+                    Path(source['config'].dataset_path).parent)
+                if config.rank == 0:
+                    (Path(config.save_root) / 'piperpika_action_contract.json').write_text(
+                        json.dumps(self.piperpika_action_contract, indent=2))
         self.device = torch.device(f"cuda:{config.local_rank}")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
@@ -321,8 +336,19 @@ class Trainer:
             foreach=False,
         )
 
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, 
-            lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
+        schedule = getattr(config, 'lr_schedule', 'constant')
+        if schedule == 'cosine':
+            from .utils.finetune import cosine_warmup_ratio
+            warmup = min(config.warmup_steps, max(0, config.num_steps - 1))
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer, lr_lambda=lambda step: cosine_warmup_ratio(
+                    step, warmup, config.num_steps, config.min_lr_ratio))
+        elif schedule == 'constant':
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer, lr_lambda=lambda step: warmup_constant_lambda(
+                    step, warmup_steps=config.warmup_steps))
+        else:
+            raise ValueError(f'Unknown learning rate schedule: {schedule}')
 
         # Setup dataloaders
         logger.info("Setting up datasets...")
@@ -407,6 +433,8 @@ class Trainer:
             if config.rank == 0:
                 try:
                     cost_started = time.perf_counter()
+                    logger.info('Building training sample costs: samples=%d workers=12',
+                                len(train_dataset))
                     sample_costs = training_sample_costs(
                         train_dataset, getattr(config, 'max_train_frames', None),
                         self.patch_size,
@@ -451,10 +479,14 @@ class Trainer:
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
-            shuffle=(train_sampler is None), 
+            shuffle=(train_sampler is None),
             num_workers=config.load_worker,
             sampler=train_sampler,
         )
+        if config.rank == 0:
+            logger.info('Training data loader ready: workers=%d backend=%s',
+                        config.load_worker,
+                        'default process context' if config.load_worker > 0 else 'main process')
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_latent.set_timesteps(1000, training=True)
@@ -757,12 +789,19 @@ class Trainer:
 
     def _train_step(self, batch, batch_idx):
         """Train a single batch, returns losses for logging."""
-        if (getattr(self.config, 'actions_per_latent', None) is not None
+        dataset_name = batch.get('_dataset_name')
+        if isinstance(dataset_name, (list, tuple)):
+            if len(dataset_name) != 1:
+                raise ValueError('Source-specific sampling requires one sample per rank')
+            dataset_name = dataset_name[0]
+        if dataset_name is None and sampling_datasets(getattr(self.config, 'action_sampling_datasets', None)) is not None:
+            raise ValueError('Source-specific sampling requires dataset identity from the loader')
+        stride, actions_per_latent = sampling_for_dataset(self.config, dataset_name)
+        if (actions_per_latent is not None
                 and batch['actions'].shape[3] != getattr(self.config, 'action_per_frame', 16)):
             raise ValueError('actions_per_latent override requires native action blocks matching '
                              'the training config action_per_frame; cannot save an inconsistent timebase')
-        batch = resample_training_batch(batch, getattr(self.config, 'action_stride', 1),
-                                        getattr(self.config, 'actions_per_latent', None))
+        batch = resample_training_batch(batch, stride, actions_per_latent)
         batch = crop_training_batch(
             batch, getattr(self.config, 'max_train_frames', None))
         window_crop = batch.get('_window_crop')
@@ -850,6 +889,9 @@ class Trainer:
                 checkpoint_dir = self.save_dir / f"checkpoint_step_{self.step}"
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+                if getattr(self, 'piperpika_action_contract', None) is not None:
+                    (checkpoint_dir / 'piperpika_action_contract.json').write_text(
+                        json.dumps(self.piperpika_action_contract, indent=2))
                 if self.aloha_action_contract is not None:
                     (checkpoint_dir / 'aloha_action_contract.json').write_text(
                         json.dumps(self.aloha_action_contract, indent=2))
@@ -868,7 +910,8 @@ class Trainer:
                 config_dict.pop('_name_or_path', None)
                 config_dict[ACTION_SAMPLING_CONFIG_KEY] = action_sampling_metadata(
                     getattr(self.config, 'action_stride', 1), getattr(self.config, 'actions_per_latent', None),
-                    getattr(self.config, 'action_per_frame', 16))
+                    getattr(self.config, 'action_per_frame', 16),
+                    datasets=getattr(self.config, 'action_sampling_datasets', None))
                 with open(config_file, 'w') as f:
                     json.dump(config_dict, f, indent=2)
 
@@ -952,7 +995,12 @@ class Trainer:
 
         while self.step < self.config.num_steps:
             # Get next batch (handles epoch reset automatically)
+            first_batch = self.step == 0 and step_in_accumulation == 0 and self.config.rank == 0
+            if first_batch:
+                logger.info('Fetching first training batch...')
             batch = self._get_next_batch()
+            if first_batch:
+                logger.info('First training batch ready; running forward/backward')
             
             losses = self._train_step(batch, step_in_accumulation)
             
@@ -1068,6 +1116,7 @@ def run(args):
         'length_bucket_steps': getattr(args, 'length_bucket_steps', None),
         'action_stride': getattr(args, 'action_stride', None),
         'actions_per_latent': getattr(args, 'actions_per_latent', None),
+        'action_sampling_datasets': getattr(args, 'action_sampling_datasets', None),
     }
     for key, value in overrides.items():
         if value is not None:
@@ -1107,6 +1156,20 @@ def run(args):
             logger.info(f"Using config: {args.config_name}")
             logger.info(f"Using DATASETS: {args.datasets}")
             logger.info(f'Training output directory: {config.save_root}')
+            (Path(config.save_root) / 'effective_config.json').write_text(
+                json.dumps(dict(config), indent=2, default=str))
+            runtime = dict(OMP_NUM_THREADS=os.environ.get('OMP_NUM_THREADS'),
+                           MKL_NUM_THREADS=os.environ.get('MKL_NUM_THREADS'),
+                           torch_num_threads=torch.get_num_threads(),
+                           torch_num_interop_threads=torch.get_num_interop_threads(),
+                           init_worker=config.init_worker, load_worker=config.load_worker)
+            (Path(config.save_root) / 'runtime_config.json').write_text(
+                json.dumps(runtime, indent=2) + '\n')
+            logger.info('CPU/data loading runtime: %s', runtime)
+            logger.info('Training setup: lr=%s schedule=%s warmup=%s global_batch=%s steps=%s model=%s',
+                        config.learning_rate, getattr(config, 'lr_schedule', 'constant'), config.warmup_steps,
+                        world_size * config.batch_size * config.gradient_accumulation_steps,
+                        config.num_steps, config.model_path)
         trainer = Trainer(config)
         trainer.train()
     except Exception:
@@ -1197,6 +1260,9 @@ def main():
     parser.add_argument('--actions-per-latent', '--actions_per_latent', type=int, default=None,
                         help='Override the number of action targets per video latent; e.g. 32 with stride 3. '
                              'Video latent sampling is adjusted to preserve physical time alignment')
+    parser.add_argument('--action-sampling-datasets', default=None,
+                        help='Comma-separated sources receiving the changed time layout; default all. '
+                             'Other replay sources retain native action/video timing')
 
     args = parser.parse_args()
     run(args)

@@ -13,8 +13,10 @@ from .va_demo_cfg import va_demo_cfg
 from .va_demo_i2va import va_demo_i2va_cfg
 
 from .va_aloha_train_cfg import va_aloha_train_cfg
+from .va_piperpika_train_cfg import va_piperpika_train_cfg
 
 VA_CONFIGS = {
+    'piperpika_train': va_piperpika_train_cfg,
     'aloha_train': va_aloha_train_cfg,
     'robotwin': va_robotwin_cfg,
     'franka': va_franka_cfg,
@@ -31,6 +33,7 @@ VA_CONFIGS = {
 }
 
 TRAIN_DATASET_CONFIGS = {
+    'piperpika': va_piperpika_train_cfg,
     'aloha': va_aloha_train_cfg,
     'robotwin': va_robotwin_train_cfg,
     'agibot': va_agibot_train_cfg,

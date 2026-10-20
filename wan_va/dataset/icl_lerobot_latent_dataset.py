@@ -6,8 +6,10 @@ per item.
 """
 
 import json
+import logging
 import os
 import re
+import time
 from bisect import bisect_right
 from functools import lru_cache, partial
 from multiprocessing import Pool
@@ -27,6 +29,7 @@ from .lerobot_latent_dataset import (
 
 
 _EPISODE_FILE_RE = re.compile(r"^(episode_\d{6})(?:_\d+_\d+)?(\.[^.]+)$")
+logger = logging.getLogger(__name__)
 
 
 def _normalize_path(value):
@@ -319,6 +322,8 @@ class ICLLeRobotLatentDataset(LatentLeRobotDataset):
             icl_sample_id=str(sample.get("sample_id", "")),
             icl_human_latent_path=str(human_latent_file),
         )
+        if getattr(self.config, 'training_dataset_name', None) is not None:
+            item['_dataset_name'] = self.config.training_dataset_name
         return item
 
 
@@ -341,23 +346,31 @@ class MultiICLLeRobotLatentDataset(torch.utils.data.Dataset):
             num_init_worker = getattr(config, "init_worker", 8)
         num_init_worker = min(max(int(num_init_worker), 1), len(repo_list))
         constructor = partial(_construct_icl_dataset, config=config)
+        started = time.perf_counter()
+
+        def collect(iterator):
+            if getattr(config, 'rank', 0) == 0:
+                iterator = tqdm(iterator, total=len(repo_list), desc='Loading ICL dataset indexes')
+            loaded = []
+            for completed, dataset in enumerate(iterator, 1):
+                loaded.append(dataset)
+                if getattr(config, 'rank', 0) == 0 and (
+                    completed == 1 or completed % 25 == 0 or completed == len(repo_list)
+                ):
+                    logger.info('Dataset indexes: %s %d/%d tasks loaded in %.1fs',
+                                config.dataset_path, completed, len(repo_list),
+                                time.perf_counter() - started)
+            return loaded
+
+        if getattr(config, 'rank', 0) == 0:
+            logger.info('Loading ICL indexes: root=%s tasks=%d workers=%d backend=%s',
+                        config.dataset_path, len(repo_list), num_init_worker,
+                        'process pool' if num_init_worker > 1 else 'main process')
         if num_init_worker == 1:
-            iterator = map(constructor, repo_list)
-            if getattr(config, "rank", 0) == 0:
-                iterator = tqdm(
-                    iterator, total=len(repo_list), desc="Loading ICL dataset indexes"
-                )
-            self._datasets = list(iterator)
+            self._datasets = collect(map(constructor, repo_list))
         else:
             with Pool(num_init_worker) as pool:
-                iterator = pool.imap(constructor, repo_list)
-                if getattr(config, "rank", 0) == 0:
-                    iterator = tqdm(
-                        iterator,
-                        total=len(repo_list),
-                        desc="Loading ICL dataset indexes",
-                    )
-                self._datasets = list(iterator)
+                self._datasets = collect(pool.imap(constructor, repo_list))
         self.index_cache_hits = sum(x.index_cache_hit for x in self._datasets)
         self.index_cache_misses = len(self._datasets) - self.index_cache_hits
         self.hf_cache_hits = sum(x.hf_cache_hit for x in self._datasets)
@@ -400,10 +413,16 @@ class MixedICLLeRobotLatentDataset(torch.utils.data.Dataset):
         for source in dataset_sources:
             name = source["name"]
             weight = float(source["weight"])
+            started = time.perf_counter()
+            if getattr(source['config'], 'rank', 0) == 0:
+                logger.info('Loading dataset source: %s', name)
             dataset = MultiICLLeRobotLatentDataset(config=source["config"])
             length = len(dataset)
             if length <= 0:
                 raise ValueError(f"Dataset {name!r} contains no valid samples")
+            if getattr(source['config'], 'rank', 0) == 0:
+                logger.info('Dataset source ready: %s samples=%d elapsed=%.1fs',
+                            name, length, time.perf_counter() - started)
             self.dataset_names.append(name)
             self.dataset_weights.append(weight)
             self.dataset_groups.append(dataset)

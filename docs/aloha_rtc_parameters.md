@@ -90,7 +90,7 @@ cd /mnt/sfs_turbo/guzhai/code/Zero-WAM-lijianwen
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 export PYTHONDONTWRITEBYTECODE=1
-export OMP_NUM_THREADS=4
+export OMP_NUM_THREADS=1
 export ASCEND_RT_VISIBLE_DEVICES=1,5,6,7
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ALOHA_PREPARED_ROOT=/mnt/sfs_turbo/lijianwen/Datasets/aloha_zerowam_v3
@@ -128,6 +128,9 @@ NPU编号是2026年10月18日本次检查到的空闲卡；以后启动前用`np
 
 ## 在 ModelArts 创建训练作业
 
+同一入口现已支持 `CONFIG_NAME=piperpika_train`，使用独立关节动作契约、20%/80% 混训和 cosine 学习率。
+该模式仅对 PiperPika 应用新的动作时间布局，回放来源保留原生布局；完整命令和 RTC 实测见 [PiperPika 说明](piperpika_rtc.md)。
+
 Notebook和ModelArts训练作业均可使用`script/train_modelarts_rtc.sh`。单机或多节点使用同一条命令，默认每个节点使用全部可见NPU，不固定为4卡或8卡。`train_dist.sh`通过共享的`script/distributed_env.sh`读取平台分配、可见设备和节点信息；ModelArts入口负责准备Ascend环境及当前RTC后训练参数。
 
 ### 控制台配置
@@ -160,14 +163,14 @@ Notebook和ModelArts训练作业均可使用`script/train_modelarts_rtc.sh`。�
 在控制台“启动命令”填入以下内容，先验证作业容器的挂载、权限和环境：
 
 ```bash
-bash /mnt/sfs_turbo/guzhai/code/Zero-WAM-lijianwen/script/train_modelarts_rtc.sh \
+OMP_NUM_THREADS=1 bash /mnt/sfs_turbo/guzhai/code/Zero-WAM-lijianwen/script/train_modelarts_rtc.sh \
   --num-steps 10 --save-interval 10
 ```
 
 通过后，新建正式训练版本，启动命令改为：
 
 ```bash
-bash /mnt/sfs_turbo/guzhai/code/Zero-WAM-lijianwen/script/train_modelarts_rtc.sh
+OMP_NUM_THREADS=1 bash /mnt/sfs_turbo/guzhai/code/Zero-WAM-lijianwen/script/train_modelarts_rtc.sh
 ```
 
 默认参数为5000步、每2500步保存、每卡batch1、累积1、ALOHA单来源、stride3、A32。脚本只在每个容器运行一次，内部`train_dist.sh`负责创建每张卡的训练进程；如控制台有外部自动多卡启动方式，选择自定义bash入口，保持单层torchrun。
@@ -193,13 +196,13 @@ ModelArts会在每个实例的容器执行同一启动命令，因此增加实�
 
 ```bash
 # 节点0：MASTER_ADDR替换成两个节点都能访问的节点0地址。
-NNODES=2 NODE_RANK=0 MASTER_ADDR=10.0.0.1 \
+OMP_NUM_THREADS=1 NNODES=2 NODE_RANK=0 MASTER_ADDR=10.0.0.1 \
 bash /mnt/sfs_turbo/guzhai/code/Zero-WAM-lijianwen/script/train_modelarts_rtc.sh
 ```
 
 ```bash
 # 节点1：使用相同的MASTER_ADDR和MASTER_PORT。
-NNODES=2 NODE_RANK=1 MASTER_ADDR=10.0.0.1 \
+OMP_NUM_THREADS=1 NNODES=2 NODE_RANK=1 MASTER_ADDR=10.0.0.1 \
 bash /mnt/sfs_turbo/guzhai/code/Zero-WAM-lijianwen/script/train_modelarts_rtc.sh
 ```
 

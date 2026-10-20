@@ -5,6 +5,7 @@ issued model actions; this validates software/timing, not task success.
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import time
 
@@ -14,9 +15,15 @@ import numpy as np
 from evaluation.aloha.rtc_client import CAMERAS, RTCPolicy, WebsocketRTCTransport
 
 
-def main():
+def main(*, dataset='aloha'):
+    if dataset not in ('aloha', 'piperpika'):
+        raise ValueError(f'Unsupported replay dataset: {dataset}')
+    piperpika = dataset == 'piperpika'
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--root', type=Path, default=Path('/mnt/sfs_turbo/lijianwen/Datasets/aloha_zerowam_v3'))
+    root_env = 'PIPERPIKA_PREPARED_ROOT' if piperpika else 'ALOHA_PREPARED_ROOT'
+    default_root = '/mnt/sfs_turbo/lijianwen/Datasets/' + (
+        'piperpika_10_16_zerowam_joint_v2' if piperpika else 'aloha_zerowam_v3')
+    p.add_argument('--root', type=Path, default=Path(os.environ.get(root_env, default_root)))
     p.add_argument('--host', default='127.0.0.1')
     p.add_argument('--port', type=int, default=29536)
     p.add_argument('--episode', type=int, default=1)
@@ -24,12 +31,14 @@ def main():
     p.add_argument('--ticks', type=int, default=512)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--warmup-rounds', type=int, default=3)
+    p.add_argument('--human-latent', type=Path, help='Explicit human demonstration override; recorded robot observations stay unchanged')
     p.add_argument('--output', type=Path, required=True)
     args = p.parse_args()
     if args.ticks < 1 or args.start < 0:
         p.error('Need positive ticks and nonnegative start')
     cv2.setNumThreads(1)
-    task = args.root/'eval/breakfast'
+    task = args.root/'eval'/('piperpika' if piperpika else 'breakfast')
+    expected_contract = json.loads((task/'meta/action_stats.json').read_text())['action_contract']
     ep = next(e for e in map(json.loads, (task/'meta/episodes.jsonl').read_text().splitlines())
               if e['episode_index'] == args.episode)
     if args.start+args.ticks > ep['length']:
@@ -48,11 +57,13 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     policy = RTCPolicy(WebsocketRTCTransport(args.host, args.port))
     actions, lateness, startup, error = [], [], None, None
+    human = args.human_latent or args.root/'human_latents'/Path(ep['icl']['human_video_path']).with_suffix('.pth')
     try:
         startup = policy.start(frames[args.start], dict(
+            expected_action_contract=expected_contract,
             seed=args.seed+args.episode*10000+args.start, prompt=ep['tasks'][0],
             use_icl=True, video_guidance_scale=-1,
-            icl_latent_path=str(args.root/'human_latents'/Path(ep['icl']['human_video_path']).with_suffix('.pth')),
+            icl_latent_path=str(human),
         ), warmup_rounds=args.warmup_rounds)
         period = 1/policy.config.control_hz
         deadline = time.monotonic()
@@ -70,9 +81,12 @@ def main():
         raise
     finally:
         report = dict(success=error is None, error=error,
+            dataset=dataset,
+            human_latent_path=str(human), human_override=args.human_latent is not None,
             protocol='30 Hz asynchronous RTC with real soft-mask VJP guidance; recorded RGB, no robot execution',
             episode=args.episode, start=args.start, num_actions=len(actions),
-            startup=startup, measurements=policy.measurements,
+            startup=startup, warmup_latencies=getattr(policy, 'warmup_latencies', []),
+            measurements=policy.measurements,
             max_controller_lateness_ms=max(lateness, default=0)*1000)
         if actions:
             np.save(args.output/'issued_actions.npy', np.asarray(actions))

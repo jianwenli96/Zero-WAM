@@ -29,7 +29,7 @@ def launch(tmp_path):
         '    print(os.environ.get("MOCK_VISIBLE_NPUS","8"))\n'
         '    sys.exit(int(os.environ.get("MOCK_PROBE_EXIT","0")))\n'
         'keys=["NNODES","NODE_RANK","MASTER_ADDR","MASTER_PORT","NGPU",'
-        '"ASCEND_RT_VISIBLE_DEVICES","PYTHONPATH"]\n'
+        '"ASCEND_RT_VISIBLE_DEVICES","PYTHONPATH","OMP_NUM_THREADS"]\n'
         'with open(os.environ["MOCK_RECORD"],"a") as f:\n'
         '    f.write(json.dumps(dict(argv=sys.argv[1:],env={k:os.environ.get(k) for k in keys}))+"\\n")\n'
     )
@@ -42,11 +42,12 @@ def launch(tmp_path):
                     'MA_NUM_HOSTS', 'MA_NUM_GPUS', 'VC_TASK_INDEX', 'VC_WORKER_NUM',
                     'VC_WORKER_HOSTS', 'MA_TORCHRUN_MASTER_PORT',
                     'ASCEND_RT_VISIBLE_DEVICES', 'CONFIG_NAME', 'DATASETS',
-                    'HF_HOME', 'HF_DATASETS_CACHE', 'XDG_CACHE_HOME'):
+                    'HF_HOME', 'HF_DATASETS_CACHE', 'XDG_CACHE_HOME', 'OMP_NUM_THREADS'):
             env.pop(key, None)
         env.update(ASCEND_ENV_FILE=str(sdk), PYTHON_BIN=str(recorder),
                    MODEL_PATH=str(model), ALOHA_PREPARED_ROOT=str(data),
                    ZERO_WAM_SAVE_ROOT=str(tmp_path/'output with spaces'),
+                   PIPERPIKA_PREPARED_ROOT=str(data),
                    MOCK_RECORD=str(record), CONFIG_NAME='aloha_train', DATASETS='aloha:1')
         env.update(variables or {})
         result = subprocess.run(['bash', str(ROOT/'script'/script), *args],
@@ -121,6 +122,53 @@ def test_training_overrides_and_default_rtc_parameters(launch):
     assert args[-len(extra):] == extra
     assert args[args.index('--action-stride')+1] == '3'
     assert args[args.index('--actions-per-latent')+1] == '32'
+    assert args[args.index('--init-worker')+1] == '2'
+    assert args[args.index('--load-worker')+1] == '2'
+    assert calls[1]['env']['OMP_NUM_THREADS'] == '4'
+
+
+def test_explicit_cpu_thread_count_is_preserved(launch):
+    result, calls = launch({'NGPU': '4', 'OMP_NUM_THREADS': '1'})
+    assert result.returncode == 0, result.stderr
+    assert calls[1]['env']['OMP_NUM_THREADS'] == '1'
+
+
+@pytest.mark.parametrize('prepare', ['0', '1'])
+def test_piperpika_rtc_preserves_mixture_schedule_and_time_layout(launch, prepare):
+    variables = {'NGPU': '4', 'CONFIG_NAME': 'piperpika_train',
+                 'DATASETS': 'piperpika:5,agibot:4,robocoin:4,robomind:4,interna1:4,oxe:4',
+                 'PREPARE_DATA': prepare}
+    result, calls = launch(variables)
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert ('distributed' if prepare == '1' else 'check') in calls[0]['argv']
+    args = calls[1]['argv']
+    for flag, value in [('--config-name', 'piperpika_train'), ('--learning-rate', '2e-6'),
+                        ('--length-bucket-steps', '8'), ('--save-interval', '500'),
+                        ('--action-stride', '3'), ('--actions-per-latent', '32'),
+                        ('--action-sampling-datasets', 'piperpika')]:
+        assert args[args.index(flag)+1] == value
+
+
+def test_python_cxx_runtime_is_preloaded_once_without_replacing_library_path(tmp_path):
+    runtime = Path(sys.prefix)/'lib/libstdc++.so.6'
+    if not runtime.is_file():
+        pytest.skip('Python environment has no bundled libstdc++')
+    env_root = tmp_path/'environment with spaces'
+    (env_root/'bin').mkdir(parents=True)
+    (env_root/'lib').mkdir()
+    python = env_root/'bin/python'
+    python.write_text('#!/bin/sh\nexit 0\n')
+    python.chmod(0o755)
+    link = env_root/'lib/libstdc++.so.6'
+    link.symlink_to(runtime)
+    helper = ROOT/'script/python_runtime.sh'
+    result = subprocess.run(['bash', '-c', 'source "$1"; source "$1"; printf "%s\\n%s" "$LD_PRELOAD" "$LD_LIBRARY_PATH"',
+                             'runtime-test', str(helper)],
+        env=dict(os.environ, PYTHON_BIN=str(python), LD_PRELOAD='libm.so.6', LD_LIBRARY_PATH='/original/cann/libs'),
+        text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [f'{runtime.resolve()}:libm.so.6', '/original/cann/libs']
 
 
 def test_npu_probe_uses_runtime_count_without_model_imports(tmp_path):

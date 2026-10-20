@@ -70,6 +70,9 @@ class RTCPolicy:
 
     def _reset(self, message):
         metadata = self.transport.infer(dict(message, reset=True, enable_rtc=True))
+        expected_contract = message.get('expected_action_contract')
+        if expected_contract is not None and metadata.get('action_contract') != expected_contract:
+            raise RTCError('Server action contract does not match the requested robot')
         if not metadata.get('enable_rtc') or metadata.get('rtc', {}).get('protocol_version') not in (1, 2):
             raise RTCError('Server must be launched with --enable-rtc and a supported protocol')
         remote = metadata['rtc']
@@ -240,7 +243,7 @@ class RTCPolicy:
 
 
 def interpolate_action(queue, native_index, stride):
-    """Native-rate command: linear XYZ/joints, quaternion SLERP, held grippers."""
+    """Linear joints/XYZ; ALOHA quaternion SLERP; hold either robot's grippers."""
     base, remainder = divmod(native_index, stride)
     left = queue[base]
     if remainder == 0 or base+1 == len(queue):
@@ -261,5 +264,6 @@ def interpolate_action(queue, native_index, stride):
                 angle = math.acos(dot)
                 q = (math.sin((1-fraction)*angle)*q0+math.sin(fraction*angle)*q1)/math.sin(angle)
             command[start:start+4] = q/np.linalg.norm(q)
+    if command.shape in ((14,), (28,)):
         command[-2:] = left[-2:]
     return command

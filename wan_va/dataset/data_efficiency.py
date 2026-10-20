@@ -61,14 +61,17 @@ def training_sample_costs(dataset, max_frames=None, patch_size=(1, 2, 2), worker
         if any(s[0] != frames for s in robot_shapes):
             raise ValueError(f'Camera lengths disagree for {task.root}: {meta}')
         native_a = int(getattr(getattr(task, 'config', None), 'action_per_frame', 16))
-        time_stride = latent_stride_for(action_stride, actions_per_latent, native_a)
+        task_config = getattr(task, 'config', None)
+        task_stride = getattr(task_config, 'action_stride', action_stride)
+        task_actions = getattr(task_config, 'actions_per_latent', actions_per_latent)
+        time_stride = latent_stride_for(task_stride, task_actions, native_a)
         frames = (frames - 1) // time_stride + 1
         frames = min(frames, max_frames) if max_frames else frames
         video_per_frame = sum((h // ph) * (w // pw) for _, h, w in robot_shapes)
         sample = task._lookup_icl_sample(meta)
         hf, hh, hw = _latent_shape(str(task._human_latent_candidate(sample)))
         human = (hf // pf) * (hh // ph) * (hw // pw)
-        action_per_frame = native_a if actions_per_latent is None else actions_per_latent
+        action_per_frame = native_a if task_actions is None else task_actions
         # Scheduling approximation; actual action layout varies by dataset.
         video = (frames // pf) * video_per_frame
         action_tokens = frames * action_per_frame

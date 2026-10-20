@@ -22,7 +22,7 @@ class RTCSession:
 
     def metadata(self):
         return dict(self.config.as_dict(), protocol_version=2 if self.config.action_stride > 1 or self.config.action_per_frame != 4*self.config.observation_stride else 1,
-                    session_id=self.session_id, full_future_horizon=True)
+                    session_id=self.session_id, full_future_horizon=True, supports_synchronous=True)
 
     def _actions(self, value, count, name):
         # MessagePack may expose a read-only buffer; keep ownership before the
@@ -70,6 +70,15 @@ class RTCSession:
             raise RTCError('RTC requires a matching session_id from reset metadata')
         action_start = req.get('action_start')
         delay = req.get('delay_steps')
+        execution_mode = req.get('execution_mode', 'asynchronous')
+        if execution_mode not in ('asynchronous', 'synchronous'):
+            raise RTCError('Unknown execution_mode')
+        synchronous = execution_mode == 'synchronous'
+        if synchronous and delay != 0:
+            raise RTCError('Synchronous requests require delay_steps=0: no commands during inference')
+        if hasattr(self, 'execution_mode') and self.execution_mode != execution_mode:
+            raise RTCError('Cannot switch execution_mode within a session')
+        self.execution_mode = execution_mode
         if isinstance(action_start, bool) or not isinstance(action_start, int):
             raise RTCError('RTC action_start must be an integer controller timestamp')
         cfg.check_delay(delay, context='requested RTC budget')
@@ -127,12 +136,13 @@ class RTCSession:
         elapsed = time.monotonic()-started
         actual_delay = cfg.elapsed_delay_steps(elapsed)
         warmup = bool(req.get('warmup', False))
-        if not bootstrap and not warmup and actual_delay > delay:
+        if not synchronous and not bootstrap and not warmup and actual_delay > delay:
             raise RTCTimingError(f'RTC inference exceeded its forecast: actual d={actual_delay}, forecast d={delay}; reset and recalibrate latency')
         self.action_start = action_start
         return dict(action=action, rtc=dict(
             session_id=self.session_id, action_start=action_start,
             horizon_actions=cfg.horizon, bootstrap=bootstrap, warmup=warmup,
+            execution_mode=execution_mode,
             guidance_applied=previous is not None,
             frozen_prefix_steps=delay if previous is not None else 0,
             server_latency_seconds=elapsed,

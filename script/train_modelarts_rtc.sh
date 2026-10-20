@@ -20,14 +20,33 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"
 
 export PYTHON_BIN="${PYTHON_BIN:-/mnt/sfs_turbo/public/apps/miniforge3/envs/lingbot-vggt/bin/python}"
+export CONFIG_NAME="${CONFIG_NAME:-aloha_train}"
+rtc_sampling_args=()
+case "$CONFIG_NAME" in
+    aloha_train)
+        rtc_default_model=/mnt/sfs_turbo/lijianwen/Codes/Zero-WAM/outputs/aloha_step6000_validation/model
+        rtc_default_datasets=aloha:1
+        rtc_default_lr=1e-5
+        rtc_default_save_interval=2500
+        ;;
+    piperpika_train)
+        rtc_sampling_args=(--action-sampling-datasets piperpika)
+        rtc_default_model=/mnt/sfs_turbo/public/ckpts/Zero-WAM/zero-wam-pretrain
+        rtc_default_datasets=piperpika:5,agibot:4,robocoin:4,robomind:4,interna1:4,oxe:4
+        rtc_default_lr=2e-6
+        rtc_default_save_interval=500
+        ;;
+    *) printf 'RTC training entry supports aloha_train or piperpika_train, got: %s\n' "$CONFIG_NAME" >&2; exit 1 ;;
+esac
 export ALOHA_PREPARED_ROOT="${ALOHA_PREPARED_ROOT:-/mnt/sfs_turbo/lijianwen/Datasets/aloha_zerowam_v3}"
-export MODEL_PATH="${MODEL_PATH:-/mnt/sfs_turbo/lijianwen/Codes/Zero-WAM/outputs/aloha_step6000_validation/model}"
-export ZERO_WAM_SAVE_ROOT="${ZERO_WAM_SAVE_ROOT:-/mnt/sfs_turbo/guzhai/modelarts_outputs/aloha_rtc_a32_stride3}"
+export PIPERPIKA_PREPARED_ROOT="${PIPERPIKA_PREPARED_ROOT:-/mnt/sfs_turbo/lijianwen/Datasets/piperpika_10_16_zerowam_joint_v2}"
+export MODEL_PATH="${MODEL_PATH:-$rtc_default_model}"
+export ZERO_WAM_SAVE_ROOT="${ZERO_WAM_SAVE_ROOT:-/mnt/sfs_turbo/guzhai/modelarts_outputs/${CONFIG_NAME%_train}_rtc_a32_stride3}"
 export HF_HOME="${HF_HOME:-$ZERO_WAM_SAVE_ROOT/.cache/huggingface}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$ZERO_WAM_SAVE_ROOT/.cache}"
-export CONFIG_NAME="${CONFIG_NAME:-aloha_train}"
-export DATASETS="${DATASETS:-aloha:1}"
+export DATASETS="${DATASETS:-$rtc_default_datasets}"
+if [[ "$DATASETS" == *,* ]]; then rtc_bucket_steps=8; else rtc_bucket_steps=0; fi
 
 export MASTER_PORT="${MASTER_PORT:-${MA_TORCHRUN_MASTER_PORT:-29648}}"
 # Keep ASCEND_RT_VISIBLE_DEVICES exactly as supplied by the platform.
@@ -41,9 +60,13 @@ if [[ ! -r "$MODEL_PATH/transformer/config.json" ]]; then
     printf 'Model not readable; check all symlink targets and mounts: %s\n' "$MODEL_PATH" >&2
     exit 1
 fi
-if [[ ! -r "$ALOHA_PREPARED_ROOT/preparation.json" ]]; then
-    printf 'Prepared ALOHA data not readable: %s\n' "$ALOHA_PREPARED_ROOT" >&2
-    exit 1
+if [[ "$CONFIG_NAME" == piperpika_train ]]; then
+    # PREPARE_DATA=1 may create metadata in train_dist.sh; check mode requires it now.
+    if [[ "${PREPARE_DATA:-1}" != 1 && ! -r "$PIPERPIKA_PREPARED_ROOT/preparation.json" ]]; then
+        printf 'Prepared PiperPika data not readable: %s\n' "$PIPERPIKA_PREPARED_ROOT" >&2; exit 1
+    fi
+elif [[ ! -r "$ALOHA_PREPARED_ROOT/preparation.json" ]]; then
+    printf 'Prepared ALOHA data not readable: %s\n' "$ALOHA_PREPARED_ROOT" >&2; exit 1
 fi
 mkdir -p "$ZERO_WAM_SAVE_ROOT" "$HF_DATASETS_CACHE" "$XDG_CACHE_HOME"
 if [[ ! -w "$ZERO_WAM_SAVE_ROOT" ]]; then
@@ -54,7 +77,7 @@ printf 'ModelArts RTC training output: %s\n' "$ZERO_WAM_SAVE_ROOT"
 
 exec bash "$rtc_repo_root/script/train_dist.sh" \
     --action-stride 3 --actions-per-latent 32 \
-    --length-bucket-steps 0 --learning-rate 1e-5 \
+    --length-bucket-steps "$rtc_bucket_steps" --learning-rate "$rtc_default_lr" \
     --batch-size 1 --gradient-accumulation-steps 1 \
-    --num-steps 5000 --save-interval 2500 \
-    --init-worker 2 --load-worker 2 --disable-wandb "$@"
+    --num-steps 5000 --save-interval "$rtc_default_save_interval" \
+    --init-worker 2 --load-worker 2 --disable-wandb "${rtc_sampling_args[@]}" "$@"

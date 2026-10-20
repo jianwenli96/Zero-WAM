@@ -380,10 +380,31 @@ class WanICLAttention(nn.Module):
                 )
             )
             query = torch.cat(query_parts, dim=1)
-            key = self.norm_k(self.to_k(encoder_hidden_states)).unflatten(
-                2, (self.heads, -1)
-            )
-            value = self.to_v(encoder_hidden_states).unflatten(2, (self.heads, -1))
+            def project_text_kv():
+                key = self.norm_k(self.to_k(encoder_hidden_states)).unflatten(
+                    2, (self.heads, -1)
+                )
+                value = self.to_v(encoder_hidden_states).unflatten(2, (self.heads, -1))
+                return key, value
+
+            reuse = (getattr(self, 'rtc_cache_text_kv', False) and not self.training
+                     and not encoder_hidden_states.requires_grad
+                     and not encoder_hidden_states.is_inference())
+            if reuse:
+                parameters = tuple(p for module in (self.to_k, self.to_v, self.norm_k)
+                                   for p in module.parameters())
+                reuse = all(not p.requires_grad and not p.is_inference() for p in parameters)
+            if reuse:
+                # These K/V do not depend on the action sample whose VJP is
+                # evaluated. Retain the source tensor to prevent id recycling;
+                # tensor/weight versions also invalidate in-place changes.
+                cache_key = ('icl_text_kv', id(self), id(encoder_hidden_states),
+                             encoder_hidden_states._version,
+                             tuple(p._version for p in parameters))
+                _, key, value = memo(cache_key,
+                    lambda: (encoder_hidden_states, *project_text_kv()))
+            else:
+                key, value = project_text_kv()
             return query, key, value, latent_length, action_length
 
         projected = []
@@ -1320,7 +1341,9 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
         # observation chunks.  Preserve the owning cache type so pruning drops
         # prediction padding but retains the same KV layout as deployment.  The
         # modality type remains -1, so these padding keys are still masked out.
-        padding_cache_type = int(cache_types[0].item())
+        padding_cache_type = input_dict.get('_rtc_padding_cache_type')
+        if padding_cache_type is None:
+            padding_cache_type = int(cache_types[0].item())
         cache_types = F.pad(
             cache_types, (0, padded_length), value=padding_cache_type
         )

@@ -27,7 +27,25 @@ def latent_stride_for(stride, actions_per_latent=None, native_actions_per_latent
     return span//native_actions_per_latent
 
 
-def action_sampling_metadata(stride, actions_per_latent=None, native_actions_per_latent=16):
+def sampling_datasets(value):
+    """None means all selected sources; otherwise scope time changes by name."""
+    if value is None or value == 'all':
+        return None
+    names = value.split(',') if isinstance(value, str) else list(value)
+    names = [str(name).strip() for name in names]
+    if not names or any(not name for name in names) or len(set(names)) != len(names):
+        raise ValueError('action_sampling_datasets requires unique nonempty dataset names')
+    return names
+
+
+def sampling_for_dataset(config, name):
+    selected = sampling_datasets(getattr(config, 'action_sampling_datasets', None))
+    if selected is not None and name not in selected:
+        return 1, None
+    return getattr(config, 'action_stride', 1), getattr(config, 'actions_per_latent', None)
+
+
+def action_sampling_metadata(stride, actions_per_latent=None, native_actions_per_latent=16, *, datasets=None):
     latent_stride = latent_stride_for(stride, actions_per_latent, native_actions_per_latent)
     result = dict(version=2, action_stride=stride, latent_stride=latent_stride,
                   layout='aligned_time_blocks', actions_per_latent_changed=False,
@@ -36,6 +54,9 @@ def action_sampling_metadata(stride, actions_per_latent=None, native_actions_per
         result.update(version=3, actions_per_latent=actions_per_latent,
                       native_actions_per_latent=native_actions_per_latent,
                       actions_per_latent_changed=actions_per_latent != native_actions_per_latent)
+    selected = sampling_datasets(datasets)
+    if selected is not None:
+        result['datasets'] = selected
     return result
 
 
@@ -97,6 +118,12 @@ def _sampling_metadata(model_root):
         if metadata.get('actions_per_latent') is None or metadata.get('latent_stride') != expected:
             raise ValueError('Checkpoint action block and latent stride contract is inconsistent')
     return metadata
+
+
+def validate_inference_sampling_dataset(model_root, name):
+    metadata = _sampling_metadata(model_root)
+    if metadata and metadata.get('datasets') is not None and name not in metadata['datasets']:
+        raise ValueError(f'Checkpoint time layout targets {metadata["datasets"]}, not {name}')
 
 
 def inference_action_stride(model_root, requested=None):

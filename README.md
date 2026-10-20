@@ -337,6 +337,14 @@ environment.
 | [ALOHA data and training](docs/aloha_training.md) | Data preparation, human-video pairing, action statistics, and post-training |
 | [RTC parameters and ModelArts (Chinese)](docs/aloha_rtc_parameters.md) | Parameter definitions, measured configurations, ModelArts mounts, and complete commands |
 | [RTC runtime](docs/rtc.md) | Timing checks, controller API, interpolation, and recorded-data replay |
+| [PiperPika mixed post-training and RTC (Chinese)](docs/piperpika_rtc.md) | Joint/gripper actions, 20%/80% replay, cosine LR, ModelArts, and RTC timing |
+
+Select `CONFIG_NAME=piperpika_train` to use PiperPika with 80% real HumanGen
+replay. The same `script/train_modelarts_rtc.sh` entry applies the 10 Hz /
+32-actions layout to PiperPika while retaining native timing for replay sources,
+and selects pretrained initialization and the PiperPika cosine learning-rate
+settings. See the guide for commands and the distinction between timing probes
+and matched post-training.
 
 ### Ascend and ModelArts Training
 
@@ -355,13 +363,13 @@ export ZERO_WAM_SAVE_ROOT=/path/to/writable/shared/aloha_rtc_output
 From the repository root, first check ten training steps and checkpoint saving:
 
 ```bash
-bash script/train_modelarts_rtc.sh --num-steps 10 --save-interval 10
+OMP_NUM_THREADS=1 bash script/train_modelarts_rtc.sh --num-steps 10 --save-interval 10
 ```
 
 Then start post-training:
 
 ```bash
-bash script/train_modelarts_rtc.sh
+OMP_NUM_THREADS=1 bash script/train_modelarts_rtc.sh
 ```
 
 The defaults are ALOHA-only training, `action_stride=3`,

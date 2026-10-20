@@ -36,6 +36,7 @@ from .modules.icl_model import (
     OBSERVATION_CACHE_TYPE,
     PREDICTION_CACHE_TYPE,
 )
+from .rtc.cache import memo
 from .utils import (
     FlowMatchScheduler,
     data_seq_to_patch,
@@ -134,6 +135,11 @@ class VA_Server:
                     module.to('cpu')
             self.transformer.attn_window = int(getattr(job_config, 'rtc_attn_window', 4))
             self.transformer.rtc_indexed_prune = True
+            # Keep layout memoization opt-in: paired 910B measurements did
+            # not show a gain beyond the existing indexed cache pruning.
+            self.rtc_stream_layout = bool(getattr(job_config, 'rtc_stream_layout', False))
+            for block in self.transformer.blocks:
+                block.attn2.rtc_cache_text_kv = bool(getattr(job_config, 'rtc_cache_text_kv', True))
         else:
             self.transformer = _configure_model(model=self.transformer,
                                             shard_fn=shard_fn,
@@ -757,7 +763,11 @@ class VA_Server:
 
     def _prepare_icl_stream(self, data, timestep, mode, cache_type):
         position = getattr(self, '_rtc_stream_position', None)
-        grid_id = get_mesh_id(
+        layout = getattr(self, 'rtc_stream_layout', False) and position is not None
+        offset = self.job_config.frame_chunk_size*self.chunk_idx if position is None else position[0]
+        mesh_key = (('rtc_stream_mesh', id(self), mode, tuple(data.shape),
+                     tuple(self.transformer.patch_size), offset, str(self.device)) if layout else None)
+        grid_id = memo(mesh_key, lambda: get_mesh_id(
             data.shape[-3],
             data.shape[-2]
             // (self.transformer.patch_size[1] if mode == "video" else 1),
@@ -765,9 +775,9 @@ class VA_Server:
             // (self.transformer.patch_size[2] if mode == "video" else 1),
             0 if mode == "video" else 1,
             1,
-            self.job_config.frame_chunk_size * self.chunk_idx if position is None else position[0],
+            offset,
             action=False,
-        ).to(self.device)
+        ).to(self.device))
         stream_key = "latent_res_lst" if mode == "video" else "action_res_lst"
         grid_key = "latent_grid_id" if mode == "video" else "action_grid_id"
         input_dict = {
@@ -783,6 +793,10 @@ class VA_Server:
             grid_key: grid_id,
         }
         self._pack_icl_cfg(input_dict, mode, cache_type)
+        if layout:
+            # _pack_icl_cfg fills every token with this Python cache type.
+            # Avoid a device-to-host scalar read in every denoising forward.
+            input_dict['_rtc_padding_cache_type'] = int(cache_type)
         if position is not None:
             input_dict['_rtc_static_key'] = (mode, tuple(data.shape), position, cache_type,
                                              self.use_icl_cfg, self.target_text_cfg_active)

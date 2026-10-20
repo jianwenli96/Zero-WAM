@@ -6,13 +6,19 @@ import os
 from pathlib import Path
 
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--root', type=Path, default=Path(os.environ.get('ALOHA_PREPARED_ROOT', '/mnt/sfs_turbo/lijianwen/Datasets/aloha_zerowam_v3')))
+def parse_args(argv=None, *, dataset='aloha'):
+    if dataset not in ('aloha', 'piperpika'):
+        raise ValueError(f'Unsupported absolute-action dataset: {dataset}')
+    piperpika = dataset == 'piperpika'
+    root_env = 'PIPERPIKA_PREPARED_ROOT' if piperpika else 'ALOHA_PREPARED_ROOT'
+    root_default = '/mnt/sfs_turbo/lijianwen/Datasets/' + (
+        'piperpika_10_16_zerowam_joint_v2' if piperpika else 'aloha_zerowam_v3')
+    p = argparse.ArgumentParser(description=f'{dataset} absolute-action ICL and RTC server')
+    p.add_argument('--root', type=Path, default=Path(os.environ.get(root_env, root_default)))
     p.add_argument('--model', type=Path, required=True, help='Complete model root: transformer, vae, tokenizer, text_encoder')
-    p.add_argument('--allow-unbound-model', action='store_true', help='Explicitly allow a base/legacy model with no saved ALOHA statistics')
+    p.add_argument('--allow-unbound-model', action='store_true', help=f'Explicitly allow a base/legacy model with no saved {dataset} statistics')
     p.add_argument('--port', type=int, default=29536)
-    p.add_argument('--steps', type=int, help='Default: 50, or 1 with RTC')
+    p.add_argument('--steps', type=int, help='Default: 20 for PiperPika, 50 for ALOHA, or 1 with RTC')
     p.add_argument('--action-steps', '--action_steps', type=int,
                    help='Override action denoising steps; --steps sets video steps and the action default')
     p.add_argument('--chunk-frames', type=int, help='Default: 2; RTC: 16 native-rate or 4 for time-strided checkpoints')
@@ -37,7 +43,7 @@ def parse_args(argv=None):
     args.execution_horizon_explicit = args.rtc_execution_horizon is not None
     args.initial_latency_explicit = args.rtc_initial_latency is not None
     coarse = (args.action_stride is not None and args.action_stride > 1) or args.actions_per_latent not in (None, 16)
-    args.steps = args.steps if args.steps is not None else (1 if args.enable_rtc else 50)
+    args.steps = args.steps if args.steps is not None else (1 if args.enable_rtc else (20 if piperpika else 50))
     args.action_steps = args.action_steps if args.action_steps is not None else args.steps
     args.chunk_frames = args.chunk_frames if args.chunk_frames is not None else ((4 if coarse else 16) if args.enable_rtc else 2)
     args.rtc_execution_horizon = args.rtc_execution_horizon if args.rtc_execution_horizon is not None else (2*(args.actions_per_latent or 16) if coarse else 128)
@@ -51,20 +57,28 @@ def parse_args(argv=None):
     return args
 
 
-def main():
-    args = parse_args()
+def main(*, dataset='aloha'):
+    args = parse_args(dataset=dataset)
     logging.basicConfig(level=logging.INFO)
     from wan_va.wan_va_server import VA_Server, init_distributed, run_async_server_mode
-    if os.environ.get('ZERO_WAM_PREDICTION_ROOT'):
+    if dataset == 'aloha' and os.environ.get('ZERO_WAM_PREDICTION_ROOT'):
         from evaluation.aloha.joint_video_trace import install
         install()
-    from wan_va.configs.va_aloha_train_cfg import va_aloha_train_cfg
-    from wan_va.dataset.aloha import model_quantiles, verify_checkpoint_contract
+    if dataset == 'piperpika':
+        from wan_va.configs.va_piperpika_train_cfg import va_piperpika_train_cfg as train_config
+        from wan_va.dataset.piperpika import model_quantiles, verify_checkpoint_contract
+        task = 'piperpika'
+    else:
+        from wan_va.configs.va_aloha_train_cfg import va_aloha_train_cfg as train_config
+        from wan_va.dataset.aloha import model_quantiles, verify_checkpoint_contract
+        task = 'breakfast'
     contract, bound = verify_checkpoint_contract(args.model, args.root, args.allow_unbound_model)
-    cfg = deepcopy(va_aloha_train_cfg)
-    cfg.norm_stat = model_quantiles(args.root / 'train/breakfast/meta/action_stats.json')
+    cfg = deepcopy(train_config)
+    cfg.norm_stat = model_quantiles(args.root / 'train' / task / 'meta/action_stats.json')
     cfg.model_path = str(args.model)
-    from wan_va.action_sampling import inference_action_stride, inference_actions_per_latent
+    from wan_va.action_sampling import (inference_action_stride, inference_actions_per_latent,
+                                        validate_inference_sampling_dataset)
+    validate_inference_sampling_dataset(args.model, dataset)
     cfg.action_stride, cfg.sampling_contract_bound = inference_action_stride(args.model, args.action_stride)
     cfg.native_action_per_frame = cfg.action_per_frame
     cfg.action_per_frame, _ = inference_actions_per_latent(args.model, args.actions_per_latent,
@@ -121,6 +135,12 @@ def main():
                 result['sampling_contract_bound'] = self.job_config.sampling_contract_bound
                 result['enable_rtc'] = self.enable_rtc
                 result['image_size'] = [self.height, self.width]
+                result['target_text_enabled'] = self.video_guidance_scale >= 0
+                result['video_guidance_scale'] = self.video_guidance_scale
+                result['icl_guidance_scale'] = self.icl_guidance_scale
+                if dataset == 'piperpika':
+                    result['action_order'] = [f'{side}_joint_{i}' for side in ('left', 'right')
+                                              for i in range(6)] + ['left_gripper', 'right_gripper']
             return result
     model = AlohaServer(cfg)
     run_async_server_mode(model, cfg.local_rank, '127.0.0.1', args.port)
